@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Online Cheating Preventer - Login</title>
+
+<style>
+body{
+    margin:0;
+    height:100vh;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    background:#0B0E11;
+    font-family:Arial,sans-serif;
+}
+
+.card{
+    width:340px;
+    background:#171C22;
+    padding:30px;
+    border-radius:12px;
+    color:white;
+}
+
+input{
+    width:100%;
+    padding:12px;
+    margin-top:15px;
+    border:none;
+    border-radius:6px;
+    box-sizing:border-box;
+}
+
+button{
+    width:100%;
+    margin-top:20px;
+    padding:12px;
+    background:#2FBF71;
+    color:white;
+    border:none;
+    border-radius:6px;
+    cursor:pointer;
+}
+
+#error{
+    color:#ff7070;
+    margin-top:15px;
+}
+</style>
+
+</head>
+<body>
+
+<div class="card">
+
+<h2>Login</h2>
+
+<input
+id="email"
+placeholder="Email">
+
+<input
+id="password"
+type="password"
+placeholder="Password">
+
+<button onclick="login()">
+Login
+</button>
+
+<div id="error"></div>
+
+</div>
+
+<script>
+
+async function login(){
+
+    const email = document.getElementById("email").value;
+    const password = document.getElementById("password").value;
+
+   const response = await fetch(
+    "http://127.0.0.1:8000/login",
+    {
+        method: "POST",
+
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+
+        body: new URLSearchParams({
+            username: email,
+            password: password
+        })
+    }
+);
+
+    const data = await response.json();
+
+    if(response.ok){
+
+    localStorage.setItem("token", data.access_token);
+
+    const payload =
+        JSON.parse(atob(data.access_token.split(".")[1]));
+
+    if(payload.role === "admin"){
+        window.location.href = "admin.html";
+    }
+    else{
+        window.location.href = "index.html";
+    }
+
+}
+else{
+
+    document.getElementById("error").innerHTML =
+        data.detail
+        ? JSON.stringify(data.detail)
+        : "Login failed";
+    }
+}
+
+</script>
+
+</body>
+</html>

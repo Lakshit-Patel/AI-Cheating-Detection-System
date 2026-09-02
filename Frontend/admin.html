@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>ProctorAI — Admin Dashboard</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f5f7fb;
+            color: #1f2937;
+        }
+
+        header {
+            height: 64px;
+            background: #ffffff;
+            border-bottom: 1px solid #e5e7eb;
+
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+
+            padding: 0 28px;
+        }
+
+        .brand {
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        button {
+            border: none;
+            border-radius: 7px;
+            padding: 9px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .docs-btn {
+            background: #111827;
+            color: white;
+        }
+
+        .logout-btn {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        main {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        .page-title {
+            font-size: 26px;
+            font-weight: 700;
+            margin-bottom: 22px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .stat-card {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .stat-label {
+            font-size: 13px;
+            color: #6b7280;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .section {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 700;
+            margin-bottom: 15px;
+        }
+
+        .session-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .session-item {
+            border: 1px solid #e5e7eb;
+            border-radius: 9px;
+            padding: 14px;
+
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+
+            cursor: pointer;
+        }
+
+        .session-item:hover {
+            background: #f9fafb;
+        }
+
+        .session-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .student-name {
+            font-weight: 700;
+        }
+
+        .session-meta {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        .session-status {
+            font-size: 12px;
+            font-weight: 700;
+            padding: 5px 9px;
+            border-radius: 6px;
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .session-status.active {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .violations {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .violation-item {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 12px;
+
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .violation-type {
+            font-weight: 600;
+        }
+
+        .violation-time {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        .empty {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .error {
+            color: #b91c1c;
+            font-size: 14px;
+        }
+
+        @media (max-width: 800px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+
+            .session-item,
+            .violation-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<header>
+
+    <div class="brand">
+        ProctorAI — Admin
+    </div>
+
+    <div class="header-actions">
+
+        <button
+            class="docs-btn"
+            onclick="openSwagger()">
+            API Documentation
+        </button>
+
+        <button
+            class="logout-btn"
+            onclick="logout()">
+            Logout
+        </button>
+
+    </div>
+
+</header>
+
+
+<main>
+
+    <div class="page-title">
+        Admin Dashboard
+    </div>
+
+
+    <!-- Statistics -->
+
+    <div class="stats">
+
+        <div class="stat-card">
+
+            <div class="stat-label">
+                Total Sessions
+            </div>
+
+            <div
+                id="totalSessions"
+                class="stat-value">
+                —
+            </div>
+
+        </div>
+
+
+        <div class="stat-card">
+
+            <div class="stat-label">
+                Total Violations
+            </div>
+
+            <div
+                id="totalViolations"
+                class="stat-value">
+                —
+            </div>
+
+        </div>
+
+
+        <div class="stat-card">
+
+            <div class="stat-label">
+                Phone Detections
+            </div>
+
+            <div
+                id="phoneDetections"
+                class="stat-value">
+                —
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- Sessions -->
+
+    <div class="section">
+
+        <div class="section-title">
+            Exam Sessions
+        </div>
+
+        <div
+            id="sessionList"
+            class="session-list">
+
+            <div class="empty">
+                Loading sessions...
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- Violations -->
+
+    <div class="section">
+
+        <div class="section-title">
+            Session Violations
+        </div>
+
+        <div
+            id="violationList"
+            class="violations">
+
+            <div class="empty">
+                Select a session to view violations.
+            </div>
+
+        </div>
+
+    </div>
+
+</main>
+
+
+<script>
+
+    const API_BASE =
+        "http://127.0.0.1:8000";
+
+
+    function getToken() {
+
+        return localStorage.getItem("token");
+
+    }
+
+
+    function authHeaders() {
+
+        const token =
+            getToken();
+
+        return {
+            "Authorization":
+                `Bearer ${token}`
+        };
+
+    }
+
+
+    /*
+     * Make sure only an authenticated
+     * admin can use this dashboard.
+     */
+
+    function checkAuthentication() {
+
+        const token =
+            getToken();
+
+        if (!token) {
+
+            window.location.href =
+                "login.html";
+
+            return false;
+
+        }
+
+        try {
+
+            const payload =
+                JSON.parse(
+                    atob(
+                        token.split(".")[1]
+                    )
+                );
+
+
+            if (
+                payload.role !== "admin"
+            ) {
+
+                alert(
+                    "Admin access required."
+                );
+
+                window.location.href =
+                    "index.html";
+
+                return false;
+
+            }
+
+
+            if (
+                payload.exp &&
+                payload.exp <
+                Math.floor(
+                    Date.now() / 1000
+                )
+            ) {
+
+                localStorage.removeItem(
+                    "token"
+                );
+
+                window.location.href =
+                    "login.html";
+
+                return false;
+
+            }
+
+        } catch (error) {
+
+            console.error(
+                "Invalid token:",
+                error
+            );
+
+            localStorage.removeItem(
+                "token"
+            );
+
+            window.location.href =
+                "login.html";
+
+            return false;
+
+        }
+
+        return true;
+
+    }
+
+
+    /*
+     * Open protected Swagger documentation.
+     */
+
+    function openSwagger() {
+
+        const token =
+            getToken();
+
+
+        if (!token) {
+
+            alert(
+                "Please login as admin first."
+            );
+
+            return;
+
+        }
+
+
+        window.open(
+            `${API_BASE}/docs?token=${encodeURIComponent(token)}`,
+            "_blank"
+        );
+
+    }
+
+
+    /*
+     * Load statistics.
+     */
+
+    async function loadStatistics() {
+
+        try {
+
+            const response =
+                await fetch(
+                    `${API_BASE}/statistics`,
+                    {
+                        headers:
+                            authHeaders()
+                    }
+                );
+
+
+            if (!response.ok) {
+
+                if (
+                    response.status === 401 ||
+                    response.status === 403
+                ) {
+
+                    throw new Error(
+                        "Not authorized"
+                    );
+
+                }
+
+                throw new Error(
+                    "Failed to load statistics"
+                );
+
+            }
+
+
+            const data =
+                await response.json();
+
+
+            document.getElementById(
+                "totalSessions"
+            ).textContent =
+                data.total_sessions ?? 0;
+
+
+            document.getElementById(
+                "totalViolations"
+            ).textContent =
+                data.total_violations ?? 0;
+
+
+            document.getElementById(
+                "phoneDetections"
+            ).textContent =
+                data.phone_detections ?? 0;
+
+        } catch (error) {
+
+            console.error(
+                "Statistics error:",
+                error
+            );
+
+        }
+
+    }
+
+
+    /*
+     * Load all sessions.
+     */
+
+    async function loadSessions() {
+
+        const container =
+            document.getElementById(
+                "sessionList"
+            );
+
+
+        try {
+
+            const response =
+                await fetch(
+                    `${API_BASE}/sessions`,
+                    {
+                        headers:
+                            authHeaders()
+                    }
+                );
+
+
+            if (!response.ok) {
+
+                throw new Error(
+                    "Failed to load sessions"
+                );
+
+            }
+
+
+            const sessions =
+                await response.json();
+
+
+            container.innerHTML = "";
+
+
+            if (
+                !sessions ||
+                sessions.length === 0
+            ) {
+
+                container.innerHTML =
+                    `<div class="empty">
+                        No exam sessions found.
+                    </div>`;
+
+                return;
+
+            }
+
+
+            sessions.forEach(
+                session => {
+
+                    const item =
+                        document.createElement(
+                            "div"
+                        );
+
+
+                    item.className =
+                        "session-item";
+
+
+                    const status =
+                        session.status ||
+                        "UNKNOWN";
+
+
+                    const statusClass =
+                        status === "ACTIVE"
+                            ? "active"
+                            : "";
+
+
+                    item.innerHTML = `
+
+                        <div class="session-info">
+
+                            <div class="student-name">
+                                ${escapeHtml(
+                                    session.student ||
+                                    "Unknown student"
+                                )}
+                            </div>
+
+                            <div class="session-meta">
+                                Session ID:
+                                ${session.session_id}
+                            </div>
+
+                            <div class="session-meta">
+                                ${escapeHtml(
+                                    session.student_email ||
+                                    ""
+                                )}
+                            </div>
+
+                        </div>
+
+                        <div
+                            class="session-status ${statusClass}">
+                            ${escapeHtml(status)}
+                        </div>
+
+                    `;
+
+
+                    item.onclick =
+                        () => loadViolations(
+                            session.session_id
+                        );
+
+
+                    container.appendChild(
+                        item
+                    );
+
+                }
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Sessions error:",
+                error
+            );
+
+
+            container.innerHTML =
+                `<div class="error">
+                    Could not load sessions.
+                </div>`;
+
+        }
+
+    }
+
+
+    /*
+     * Load violations for selected session.
+     */
+
+    async function loadViolations(
+        sessionId
+    ) {
+
+        const container =
+            document.getElementById(
+                "violationList"
+            );
+
+
+        container.innerHTML =
+            `<div class="empty">
+                Loading violations...
+            </div>`;
+
+
+        try {
+
+            const response =
+                await fetch(
+                    `${API_BASE}/sessions/${sessionId}/violations`,
+                    {
+                        headers:
+                            authHeaders()
+                    }
+                );
+
+
+            if (!response.ok) {
+
+                throw new Error(
+                    "Failed to load violations"
+                );
+
+            }
+
+
+            const violations =
+                await response.json();
+
+
+            container.innerHTML = "";
+
+
+            if (
+                !violations ||
+                violations.length === 0
+            ) {
+
+                container.innerHTML =
+                    `<div class="empty">
+                        No violations recorded.
+                    </div>`;
+
+                return;
+
+            }
+
+
+            violations.forEach(
+                violation => {
+
+                    const item =
+                        document.createElement(
+                            "div"
+                        );
+
+
+                    item.className =
+                        "violation-item";
+
+
+                    const violationType =
+                        violation.violation_type ||
+                        violation.type ||
+                        "Unknown violation";
+
+
+                    const timestamp =
+                        violation.timestamp ||
+                        violation.created_at ||
+                        "";
+
+
+                    item.innerHTML = `
+
+                        <div class="violation-type">
+                            ${escapeHtml(
+                                violationType
+                            )}
+                        </div>
+
+                        <div class="violation-time">
+                            ${escapeHtml(
+                                String(timestamp)
+                            )}
+                        </div>
+
+                    `;
+
+
+                    container.appendChild(
+                        item
+                    );
+
+                }
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Violations error:",
+                error
+            );
+
+
+            container.innerHTML =
+                `<div class="error">
+                    Could not load violations.
+                </div>`;
+
+        }
+
+    }
+
+
+    /*
+     * Prevent HTML injection when
+     * displaying server data.
+     */
+
+    function escapeHtml(value) {
+
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+
+    }
+
+
+    function logout() {
+
+        localStorage.removeItem(
+            "token"
+        );
+
+        window.location.href =
+            "login.html";
+
+    }
+
+
+    /*
+     * Start dashboard.
+     */
+
+    if (
+        checkAuthentication()
+    ) {
+
+        loadStatistics();
+
+        loadSessions();
+
+    }
+
+</script>
+
+</body>
+</html>

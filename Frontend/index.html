@@ -1,0 +1,1101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>ProctorAI — Exam Monitoring</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+
+    header {
+      height: 64px;
+      background: #ffffff;
+      border-bottom: 1px solid #e5e7eb;
+
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+
+      padding: 0 28px;
+    }
+
+    .brand {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+
+      font-size: 14px;
+      color: #4b5563;
+    }
+
+    .conn-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #9ca3af;
+    }
+
+    .conn-dot.live {
+      background: #22c55e;
+    }
+
+    .conn-dot.connecting {
+      background: #f59e0b;
+    }
+
+    .conn-dot.offline {
+      background: #ef4444;
+    }
+
+    main {
+      max-width: 1100px;
+      margin: 30px auto;
+      padding: 0 20px;
+    }
+
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+
+      margin-bottom: 20px;
+    }
+
+    .title {
+      font-size: 26px;
+      font-weight: 700;
+    }
+
+    .session {
+      font-size: 14px;
+      color: #6b7280;
+    }
+
+    .monitor-card {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+
+      padding: 20px;
+
+      box-shadow: 0 5px 20px rgba(0, 0, 0, 0.05);
+    }
+
+    .camera-wrapper {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+
+      background: #111827;
+
+      border-radius: 10px;
+
+      overflow: hidden;
+
+      display: flex;
+      align-items: center;
+      justify-content: center;
+
+      position: relative;
+    }
+
+    #feed {
+      width: 100%;
+      height: 100%;
+
+      object-fit: contain;
+
+      display: none;
+    }
+
+    #placeholder {
+      color: #9ca3af;
+      text-align: center;
+      font-size: 15px;
+    }
+
+    .controls {
+      margin-top: 18px;
+
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+
+      gap: 20px;
+    }
+
+    #startBtn {
+      border: none;
+      background: #111827;
+      color: white;
+
+      padding: 11px 18px;
+
+      border-radius: 8px;
+
+      cursor: pointer;
+
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    #startBtn:hover {
+      opacity: 0.9;
+    }
+
+    .status-box {
+      padding: 10px 14px;
+
+      border-radius: 8px;
+
+      background: #f3f4f6;
+
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .status-box.secure {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .status-box.flagged {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .telemetry {
+      margin-top: 20px;
+
+      display: grid;
+
+      grid-template-columns: repeat(4, 1fr);
+
+      gap: 12px;
+    }
+
+    .telemetry-card {
+      background: #f9fafb;
+
+      border: 1px solid #e5e7eb;
+
+      border-radius: 10px;
+
+      padding: 14px;
+    }
+
+    .telemetry-label {
+      font-size: 12px;
+      color: #6b7280;
+
+      margin-bottom: 5px;
+    }
+
+    .telemetry-value {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .violation-panel {
+      margin-top: 20px;
+
+      padding: 15px;
+
+      border-radius: 10px;
+
+      background: #fff7ed;
+
+      border: 1px solid #fed7aa;
+
+      display: none;
+    }
+
+    .violation-title {
+      font-weight: 700;
+
+      margin-bottom: 5px;
+
+      color: #9a3412;
+    }
+
+    .violation-text {
+      color: #7c2d12;
+
+      font-size: 14px;
+    }
+
+    @media (max-width: 800px) {
+      .telemetry {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .controls {
+        flex-direction: column;
+        align-items: stretch;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+
+  <div class="brand">
+    ProctorAI
+  </div>
+
+  <div class="connection">
+
+    <div
+      id="connDot"
+      class="conn-dot offline">
+    </div>
+
+    <span id="connLabel">
+      Offline
+    </span>
+
+  </div>
+
+</header>
+
+
+<main>
+
+  <div class="top">
+
+    <div>
+
+      <div class="title">
+        Exam Monitoring
+      </div>
+
+      <div class="session">
+        Session ID:
+        <strong id="sessionIdLabel">—</strong>
+      </div>
+
+    </div>
+
+  </div>
+
+
+  <div class="monitor-card">
+
+    <div class="camera-wrapper">
+
+      <canvas
+        id="feed"
+        width="640"
+        height="480">
+      </canvas>
+
+      <div id="placeholder">
+        Camera monitoring is not active.
+      </div>
+
+    </div>
+
+
+    <div class="controls">
+
+      <button id="startBtn">
+        Start monitoring
+      </button>
+
+      <div
+        id="statusBox"
+        class="status-box">
+        Waiting
+      </div>
+
+    </div>
+
+
+    <div class="telemetry">
+
+      <div class="telemetry-card">
+
+        <div class="telemetry-label">
+          Face Count
+        </div>
+
+        <div
+          id="faceCount"
+          class="telemetry-value">
+          —
+        </div>
+
+      </div>
+
+
+      <div class="telemetry-card">
+
+        <div class="telemetry-label">
+          Pitch
+        </div>
+
+        <div
+          id="pitch"
+          class="telemetry-value">
+          —
+        </div>
+
+      </div>
+
+
+      <div class="telemetry-card">
+
+        <div class="telemetry-label">
+          Yaw
+        </div>
+
+        <div
+          id="yaw"
+          class="telemetry-value">
+          —
+        </div>
+
+      </div>
+
+
+      <div class="telemetry-card">
+
+        <div class="telemetry-label">
+          Roll
+        </div>
+
+        <div
+          id="roll"
+          class="telemetry-value">
+          —
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div
+      id="violationPanel"
+      class="violation-panel">
+
+      <div class="violation-title">
+        Violation Detected
+      </div>
+
+      <div
+        id="violationText"
+        class="violation-text">
+      </div>
+
+    </div>
+
+  </div>
+
+</main>
+
+
+<script>
+
+  const WS_URL_BASE =
+    'ws://localhost:8000/ws/';
+
+
+  const startBtn =
+    document.getElementById('startBtn');
+
+  const canvas =
+    document.getElementById('feed');
+
+  const ctx =
+    canvas.getContext('2d');
+
+
+  const placeholder =
+    document.getElementById('placeholder');
+
+
+  const hiddenVideo =
+    document.createElement('video');
+
+  hiddenVideo.autoplay = true;
+  hiddenVideo.playsInline = true;
+  hiddenVideo.muted = true;
+
+
+  const captureCanvas =
+    document.createElement('canvas');
+
+  captureCanvas.width = 480;
+  captureCanvas.height = 360;
+
+
+  const captureCtx =
+    captureCanvas.getContext('2d');
+
+
+  let ws = null;
+
+  let sessionId = null;
+
+  let sending = false;
+
+  let mediaStream = null;
+
+  let violationCount = 0;
+
+
+  function setConnectionState(state) {
+
+    const dot =
+      document.getElementById('connDot');
+
+    const label =
+      document.getElementById('connLabel');
+
+
+    dot.className =
+      'conn-dot ' + state;
+
+
+    if (state === 'live') {
+
+      label.textContent = 'Live';
+
+    } else if (state === 'connecting') {
+
+      label.textContent = 'Connecting…';
+
+    } else {
+
+      label.textContent = 'Offline';
+
+    }
+
+  }
+
+
+  async function startMonitoring() {
+
+    try {
+
+      mediaStream =
+        await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: 640,
+            height: 480
+          }
+        });
+
+    } catch (err) {
+
+      alert(
+        'Could not access the camera: ' +
+        err.message
+      );
+
+      return;
+
+    }
+
+
+    hiddenVideo.srcObject =
+      mediaStream;
+
+
+    await hiddenVideo.play();
+
+
+    const token =
+      localStorage.getItem('token');
+
+
+    if (!token) {
+
+      console.error(
+        'No authentication token found'
+      );
+
+      alert(
+        'Please login again.'
+      );
+
+      return;
+
+    }
+
+
+    /*
+      Create the persistent exam session
+      before opening the WebSocket.
+    */
+
+    let response;
+
+    try {
+
+      response =
+        await fetch(
+          'http://127.0.0.1:8000/api/v1/sessions',
+          {
+            method: 'POST',
+
+            headers: {
+              'Authorization':
+                `Bearer ${token}`
+            }
+          }
+        );
+
+    } catch (err) {
+
+      console.error(
+        'Session creation failed:',
+        err
+      );
+
+      alert(
+        'Could not connect to the server.'
+      );
+
+      return;
+
+    }
+
+
+    if (!response.ok) {
+
+      console.error(
+        'Failed to create exam session:',
+        response.status
+      );
+
+      alert(
+        'Could not create exam session.'
+      );
+
+      return;
+
+    }
+
+
+    const sessionData =
+      await response.json();
+
+
+    sessionId =
+      sessionData.session_id;
+
+
+    console.log(
+      'Exam session created:',
+      sessionId
+    );
+
+
+    document.getElementById(
+      'sessionIdLabel'
+    ).textContent =
+      sessionId;
+
+
+    placeholder.style.display =
+      'none';
+
+
+    canvas.style.display =
+      'block';
+
+
+    setConnectionState(
+      'connecting'
+    );
+
+
+    connectSocket();
+
+
+    startBtn.textContent =
+      'Stop monitoring';
+
+
+    startBtn.onclick =
+      stopMonitoring;
+
+  }
+
+
+  function connectSocket() {
+
+    const token =
+      localStorage.getItem('token');
+
+
+    if (!token || !sessionId) {
+
+      console.error(
+        'Missing token or session ID'
+      );
+
+      return;
+
+    }
+
+
+    ws =
+      new WebSocket(
+        `${WS_URL_BASE}${sessionId}?token=${encodeURIComponent(token)}`
+      );
+
+
+    ws.onopen = () => {
+
+      console.log(
+        'WebSocket connected'
+      );
+
+
+      setConnectionState(
+        'live'
+      );
+
+
+      sending = true;
+
+
+      sendLoop();
+
+    };
+
+
+    ws.onmessage = (event) => {
+
+      let data;
+
+      try {
+
+        data =
+          JSON.parse(event.data);
+
+      } catch (err) {
+
+        console.error(
+          'Invalid server response:',
+          err
+        );
+
+        return;
+
+      }
+
+
+      if (data.error) {
+
+        console.error(
+          'Server error:',
+          data.error
+        );
+
+        return;
+
+      }
+
+
+      renderFrame(data);
+
+      updateTelemetry(data);
+
+      updateStatus(data);
+
+    };
+
+
+    ws.onclose = (event) => {
+
+      console.log(
+        'WebSocket closed:',
+        event.code,
+        event.reason
+      );
+
+
+      sending = false;
+
+
+      setConnectionState(
+        'offline'
+      );
+
+    };
+
+
+    ws.onerror = (error) => {
+
+      console.error(
+        'WebSocket error:',
+        error
+      );
+
+
+      setConnectionState(
+        'offline'
+      );
+
+    };
+
+  }
+
+
+  function sendLoop() {
+
+    if (!sending) {
+      return;
+    }
+
+
+    if (
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+
+      return;
+
+    }
+
+
+    captureCtx.drawImage(
+      hiddenVideo,
+      0,
+      0,
+      captureCanvas.width,
+      captureCanvas.height
+    );
+
+
+    captureCanvas.toBlob(
+      (blob) => {
+
+        if (
+          !blob ||
+          !ws ||
+          ws.readyState !== WebSocket.OPEN
+        ) {
+
+          return;
+
+        }
+
+
+        blob.arrayBuffer()
+          .then((buffer) => {
+
+            if (
+              ws &&
+              ws.readyState === WebSocket.OPEN
+            ) {
+
+              ws.send(buffer);
+
+            }
+
+          });
+
+      },
+      'image/jpeg',
+      0.75
+    );
+
+
+    setTimeout(
+      sendLoop,
+      200
+    );
+
+  }
+
+
+  function renderFrame(data) {
+
+    if (!data.frame) {
+      return;
+    }
+
+
+    const img =
+      new Image();
+
+
+    img.onload = () => {
+
+      ctx.clearRect(
+        0,
+        0,
+        canvas.width,
+        canvas.height
+      );
+
+
+      ctx.drawImage(
+        img,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+      );
+
+    };
+
+
+    img.src =
+      'data:image/jpeg;base64,' +
+      data.frame;
+
+  }
+
+
+  function updateTelemetry(data) {
+
+    document.getElementById(
+      'faceCount'
+    ).textContent =
+      data.face_count ?? '—';
+
+
+    document.getElementById(
+      'pitch'
+    ).textContent =
+      data.pitch !== undefined
+        ? Number(data.pitch).toFixed(1)
+        : '—';
+
+
+    document.getElementById(
+      'yaw'
+    ).textContent =
+      data.yaw !== undefined
+        ? Number(data.yaw).toFixed(1)
+        : '—';
+
+
+    document.getElementById(
+      'roll'
+    ).textContent =
+      data.roll !== undefined
+        ? Number(data.roll).toFixed(1)
+        : '—';
+
+  }
+
+
+  function updateStatus(data) {
+
+    const statusBox =
+      document.getElementById(
+        'statusBox'
+      );
+
+
+    const status =
+      data.status || 'UNKNOWN';
+
+
+    if (
+      status.startsWith('FLAGGED')
+    ) {
+
+      statusBox.textContent =
+        status;
+
+
+      statusBox.className =
+        'status-box flagged';
+
+
+      showViolation(
+        status
+      );
+
+    } else {
+
+      statusBox.textContent =
+        status;
+
+
+      statusBox.className =
+        'status-box secure';
+
+    }
+
+  }
+
+
+  function showViolation(status) {
+
+    const panel =
+      document.getElementById(
+        'violationPanel'
+      );
+
+
+    const text =
+      document.getElementById(
+        'violationText'
+      );
+
+
+    text.textContent =
+      status;
+
+
+    panel.style.display =
+      'block';
+
+
+    violationCount++;
+
+
+    setTimeout(() => {
+
+      panel.style.display =
+        'none';
+
+    }, 1500);
+
+  }
+
+
+  async function stopMonitoring() {
+
+    sending = false;
+
+
+    if (ws) {
+
+      ws.close();
+
+      ws = null;
+
+    }
+
+
+    if (mediaStream) {
+
+      mediaStream
+        .getTracks()
+        .forEach(
+          track => track.stop()
+        );
+
+      mediaStream = null;
+
+    }
+
+
+    /*
+      Mark the persistent session as completed.
+    */
+
+    if (sessionId) {
+
+      const token =
+        localStorage.getItem(
+          'token'
+        );
+
+
+      try {
+
+        const response =
+          await fetch(
+            `http://127.0.0.1:8000/api/v1/sessions/${sessionId}`,
+            {
+              method: 'DELETE',
+
+              headers: {
+                'Authorization':
+                  `Bearer ${token}`
+              }
+            }
+          );
+
+
+        if (response.ok) {
+
+          console.log(
+            'Exam session completed:',
+            sessionId
+          );
+
+        } else {
+
+          console.error(
+            'Failed to complete session:',
+            response.status
+          );
+
+        }
+
+      } catch (err) {
+
+        console.error(
+          'Error completing session:',
+          err
+        );
+
+      }
+
+    }
+
+
+    setConnectionState(
+      'offline'
+    );
+
+
+    placeholder.style.display =
+      'block';
+
+
+    canvas.style.display =
+      'none';
+
+
+    startBtn.textContent =
+      'Start monitoring';
+
+
+    startBtn.onclick =
+      startMonitoring;
+
+  }
+
+
+  startBtn.onclick =
+    startMonitoring;
+
+
+  setConnectionState(
+    'offline'
+  );
+
+</script>
+
+</body>
+</html>
