@@ -69,59 +69,47 @@ placeholder="Password">
 Login
 </button>
 
-<div id="error"></div>
+<div id="error" role="alert" aria-live="polite"></div>
 
 </div>
 
 <script>
-
-async function login(){
-
-    const email = document.getElementById("email").value;
-    const password = document.getElementById("password").value;
-
-   const response = await fetch(
-    "http://127.0.0.1:8000/login",
-    {
-        method: "POST",
-
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
-
-        body: new URLSearchParams({
-            username: email,
-            password: password
-        })
-    }
-);
-
-    const data = await response.json();
-
-    if(response.ok){
-
-    localStorage.setItem("token", data.access_token);
-
-    const payload =
-        JSON.parse(atob(data.access_token.split(".")[1]));
-
-    if(payload.role === "admin"){
-        window.location.href = "admin.html";
-    }
-    else{
-        window.location.href = "index.html";
-    }
-
+const API_BASE = localStorage.getItem('apiBase') || 'http://127.0.0.1:8000';
+function parseJwt(token) {
+  try {
+    const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(decodeURIComponent(escape(atob(part))));
+  } catch { return null; }
 }
-else{
-
-    document.getElementById("error").innerHTML =
-        data.detail
-        ? JSON.stringify(data.detail)
-        : "Login failed";
-    }
+async function login() {
+  const errorBox = document.getElementById('error');
+  errorBox.textContent = '';
+  const email = document.getElementById('email').value.trim().toLowerCase();
+  const password = document.getElementById('password').value;
+  if (!email || !password) { errorBox.textContent = 'Enter your email and password.'; return; }
+  const button = document.querySelector('button');
+  button.disabled = true; button.textContent = 'Signing in…';
+  try {
+    const response = await fetch(`${API_BASE}/login`, {
+      method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({username: email, password})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || 'Login failed. Check your credentials.');
+    const payload = parseJwt(data.access_token);
+    if (!payload || !payload.role || !data.refresh_token) throw new Error('Server returned an invalid token response.');
+    localStorage.setItem('token', data.access_token);
+    localStorage.setItem('refresh_token', data.refresh_token);
+    localStorage.setItem('token_exp', String(payload.exp || 0));
+    if (payload.role === 'admin') location.href = 'admin.html';
+    else if (payload.role === 'student') location.href = 'index.html';
+    else throw new Error('Your account has an unsupported role.');
+  } catch (err) {
+    errorBox.textContent = err.message || 'Could not connect to the server.';
+  } finally { button.disabled = false; button.textContent = 'Login'; }
 }
-
+document.getElementById('email').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 </script>
 
 </body>

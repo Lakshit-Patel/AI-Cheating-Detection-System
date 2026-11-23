@@ -1,44 +1,69 @@
-# Python virtual environment
-venv/
-.venv/
-env/
+# Environment & Secrets
+.env
+.env.local
+*.env
+!.env.example
 
-# Python cache
+# Python & Bytecode
 __pycache__/
 *.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Environment variables
-.env
-.env.*
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
 
-# Databases
+# Database & Storage
 *.db
 *.sqlite
 *.sqlite3
+postgres_data/
 
-# IDE
+# Model Weights (downloaded dynamically or via setup)
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# IDE & OS Files
 .vscode/
 .idea/
-
-# OS files
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs & Temp
 *.log
-
-# Temporary files
-*.tmp
-*.temp
-
-# Build files
-build/
-dist/
-*.egg-info/
-
-# Jupyter
-.ipynb_checkpoints/
-# Local databases
-Backend/*.db
-Backend/*.sqlite
-Backend/*.sqlite3
+*.zip
+# Temporary backups and old model weights
+*.bak
+*.pt.backup
+*.pt.old

@@ -1,998 +1,556 @@
+from __future__ import annotations
+
+import asyncio
 import base64
 import logging
-import traceback
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import cv2
 import numpy as np
-
-from datetime import datetime, UTC
-
 from fastapi import (
+    Depends,
     FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
-    HTTPException,
-    Depends,
-    File,
-    UploadFile,
-    Request,
 )
-from fastapi.openapi.docs import get_swagger_ui_html
-
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from fastapi.openapi.docs import get_swagger_ui_html
+from sqlalchemy import func, text
+from sqlalchemy.orm import Session, joinedload
 
-from sqlalchemy import func
-from sqlalchemy.orm import joinedload
-
-from .database import engine, SessionLocal
-from .models import Base, User, ExamSession, Violation
+from .auth import decode_access_token
+from .config import APP_ENV, APP_NAME, CORS_ORIGINS, MAX_FRAME_BYTES
+from .database import SessionLocal, get_db
 from .detector import Detector
-from .schemas import UserRegister
-
-from .auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    verify_access_token,
+from .model_manager import model_manager
+from .models import ExamSession, User, Violation
+from .security_dependencies import get_current_user, require_admin
+from .auth_routes import router as auth_router
+from .violation_engine import ViolationEngine
+from .rate_limit import limiter
+from .schemas import (
+    EventsResponse,
+    ReportResponse,
+    SessionCreateResponse,
+    SessionDetailResponse,
+    SessionEndResponse,
+    SessionListItem,
+    StatisticsResponse,
+    ViolationItem,
 )
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proctor")
 
+
+# Sessions that currently have a live monitoring WebSocket (per process; single-worker design).
+LIVE_SESSIONS: set[int] = set()
+NEW_SESSION_GRACE_SECONDS = 15
+MAX_CONSECUTIVE_FRAME_FAILURES = 10
+
+
+def _close_open_violations(db: Session, session_id: int, end: datetime) -> int:
+    """Give every still-open violation of a session a duration. Returns rows closed."""
+    rows = db.query(Violation).filter(
+        Violation.session_id == session_id, Violation.duration_seconds.is_(None)
+    ).all()
+    for row in rows:
+        start = _to_utc(row.timestamp)
+        row.duration_seconds = max(0.0, (end - start).total_seconds()) if start else 0.0
+    return len(rows)
+
+
+def _abandon_session(db: Session, session: ExamSession, now: datetime) -> None:
+    session.status = "CANCELLED"
+    session.end_time = now
+    _close_open_violations(db, session.id, now)
+
+
+def _to_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        # A fresh process has no live sockets, so any ACTIVE row is an orphan from a
+        # crash/restart. Close it (CANCELLED) so students are not locked out by a 409.
+        now = datetime.now(UTC)
+        orphans = db.query(ExamSession).filter(ExamSession.status == "ACTIVE").all()
+        for orphan in orphans:
+            _abandon_session(db, orphan, now)
+        if orphans:
+            db.commit()
+            logger.warning("Closed %d orphaned ACTIVE session(s) at startup", len(orphans))
+        yield
+    finally:
+        db.close()
+        model_manager.close()
+
+
 app = FastAPI(
-    title="Online Cheating Preventer API",
+    title=APP_NAME,
+    version="3.0.0",
+    lifespan=lifespan,
     docs_url=None,
-    redoc_url=None
+    redoc_url=None,
 )
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-Base.metadata.create_all(bind=engine)
-
-
-# ============================================================
-# DEFAULT USERS
-# ============================================================
-
-db = SessionLocal()
-
-student = (
-    db.query(User)
-    .filter(User.email == "student@test.com")
-    .first()
-)
-
-if student is None:
-    student = User(
-        name="Lakshit",
-        email="student@test.com",
-        role="student",
-        password_hash=hash_password("password123")
-    )
-
-    db.add(student)
-    db.commit()
-
-
-proctor = (
-    db.query(User)
-    .filter(User.email == "admin@test.com")
-    .first()
-)
-
-if proctor is None:
-    proctor = User(
-        name="Admin",
-        email="admin@test.com",
-        role="admin",
-        password_hash=hash_password("admin123")
-    )
-
-    db.add(proctor)
-    db.commit()
-
-db.close()
-
-
-# ============================================================
-# CORS
-# ============================================================
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+app.include_router(auth_router)
 
 
-# ============================================================
-# AUTH HELPERS
-# ============================================================
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = verify_access_token(token)
-
-    if payload is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token"
-        )
-
-    return payload
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    import uuid
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+    return response
 
 
-def require_admin(current_user=Depends(get_current_user)):
-    if current_user["role"] != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Admin access required"
-        )
+@app.get("/health", tags=["system"])
+def health_check():
+    return {"status": "ok", "environment": APP_ENV}
 
-    return current_user
+
+@app.get("/ready", tags=["system"])
+def ready_check(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return {"status": "ready", "phone_model": model_manager.status()}
+
 
 @app.get("/docs", include_in_schema=False)
-async def custom_docs(request: Request):
-    token = request.query_params.get("token")
-
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required"
-        )
-
-    payload = verify_access_token(token)
-
-    if payload is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token"
-        )
-
-    if payload.get("role") != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Admin access required"
-        )
-
-    return get_swagger_ui_html(
-        openapi_url=app.openapi_url,
-        title="Online Cheating Preventer API - Swagger"
-    )
+async def custom_docs(request: Request, current_user: User = Depends(require_admin)):
+    if APP_ENV == "production":
+        raise HTTPException(status_code=404, detail="Not found")
+    return get_swagger_ui_html(openapi_url=app.openapi_url, title=f"{APP_NAME} - Swagger")
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
-
-# ============================================================
-# REGISTER
-# ============================================================
-
-@app.post("/register")
-def register(user: UserRegister):
-    db = SessionLocal()
-
-    existing = (
-        db.query(User)
-        .filter(User.email == user.email)
-        .first()
-    )
-
-    if existing:
-        db.close()
-
-        return {
-            "message": "Email already exists"
-        }
-
-    new_user = User(
-        name=user.name,
-        email=user.email,
-        role="student",
-        password_hash=hash_password(user.password)
-    )
-
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    db.close()
-
-    return {
-        "message": "User registered successfully",
-        "user_id": new_user.id
-    }
-
-
-# ============================================================
-# LOGIN
-# ============================================================
-
-@app.post("/login")
-def login(
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
-    db = SessionLocal()
-
-    existing = (
-        db.query(User)
-        .filter(User.email == form_data.username)
-        .first()
-    )
-
-    if existing is None:
-        db.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password"
-        )
-
-    if not verify_password(
-        form_data.password,
-        existing.password_hash
-    ):
-        db.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password"
-        )
-
-    token = create_access_token(
+@app.get("/sessions", response_model=list[SessionListItem], tags=["admin"])
+def get_sessions(_: User = Depends(require_admin), db: Session = Depends(get_db)):
+    sessions = db.query(ExamSession).options(joinedload(ExamSession.student)).order_by(ExamSession.start_time.desc()).all()
+    return [
         {
-            "sub": str(existing.id),
-            "role": existing.role
+            "id": s.id,
+            "student": s.student.name,
+            "student_email": s.student.email,
+            "start_time": s.start_time,
+            "end_time": s.end_time,
+            "status": s.status,
         }
-    )
-
-    db.close()
-
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+        for s in sessions
+    ]
 
 
-# ============================================================
-# ADMIN — ALL SESSIONS
-# ============================================================
+@app.post("/api/v1/sessions", response_model=SessionCreateResponse, tags=["sessions"])
+def create_session(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "student":
+        raise HTTPException(status_code=403, detail="Only students can create exam sessions")
 
-@app.get("/sessions")
-def get_sessions(
-    current_user=Depends(require_admin)
-):
-    db = SessionLocal()
+    now = datetime.now(UTC)
+    for active in db.query(ExamSession).filter(
+        ExamSession.student_id == current_user.id,
+        ExamSession.status == "ACTIVE",
+    ).all():
+        started = _to_utc(active.start_time) or now
+        is_live = active.id in LIVE_SESSIONS or (now - started).total_seconds() < NEW_SESSION_GRACE_SECONDS
+        if is_live:
+            raise HTTPException(status_code=409, detail=f"Student already has active session {active.id}")
+        _abandon_session(db, active, now)   # no live connection: the browser died / WS failed
 
-    sessions = (
-        db.query(ExamSession)
-        .options(joinedload(ExamSession.student))
-        .all()
-    )
-
-    result = []
-
-    for session in sessions:
-        result.append({
-            "id": session.id,
-            "student": session.student.name,
-            "student_email": session.student.email,
-            "start_time": session.start_time,
-            "end_time": session.end_time,
-            "status": session.status
-        })
-
-    db.close()
-
-    return result
-
-
-# ============================================================
-# CREATE SESSION
-# ============================================================
-
-@app.post("/api/v1/sessions")
-def create_session(
-    current_user=Depends(get_current_user)
-):
-    if current_user["role"] != "student":
-        raise HTTPException(
-            status_code=403,
-            detail="Only students can create exam sessions"
-        )
-
-    db = SessionLocal()
-
-    session = ExamSession(
-        student_id=int(current_user["sub"]),
-        start_time=datetime.now(UTC),
-        status="ACTIVE"
-    )
-
+    session = ExamSession(student_id=current_user.id, start_time=now, status="ACTIVE")
     db.add(session)
     db.commit()
     db.refresh(session)
-
-    result = {
+    return {
         "session_id": session.id,
         "student_id": session.student_id,
         "start_time": session.start_time,
-        "status": session.status
+        "status": session.status,
     }
 
-    db.close()
 
-    return result
-
-
-# ============================================================
-# GET SESSION
-# ============================================================
-
-@app.get("/api/v1/sessions/{session_id}")
-def get_session(
-    session_id: int,
-    current_user=Depends(get_current_user)
-):
-    db = SessionLocal()
-
-    session = (
-        db.query(ExamSession)
-        .filter(ExamSession.id == session_id)
-        .first()
-    )
-
+def _get_session_for_user(session_id: int, user: User, db: Session) -> ExamSession:
+    session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
     if session is None:
-        db.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+    if user.role != "admin" and session.student_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this session")
+    return session
 
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found"
-        )
 
-    if (
-        current_user["role"] != "admin"
-        and session.student_id != int(current_user["sub"])
-    ):
-        db.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to view this session"
-        )
-
-    result = {
+@app.get("/api/v1/sessions/{session_id}", response_model=SessionDetailResponse, tags=["sessions"])
+def get_session(session_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = _get_session_for_user(session_id, current_user, db)
+    violation_count = db.query(func.count(Violation.id)).filter(Violation.session_id == session.id).scalar() or 0
+    return {
         "session_id": session.id,
         "student_id": session.student_id,
         "start_time": session.start_time,
         "end_time": session.end_time,
         "status": session.status,
-        "violation_count": len(session.violations)
+        "violation_count": violation_count,
     }
 
-    db.close()
 
-    return result
-
-
-# ============================================================
-# END SESSION
-# ============================================================
-
-@app.delete("/api/v1/sessions/{session_id}")
-def end_session(
-    session_id: int,
-    current_user=Depends(get_current_user)
-):
-    db = SessionLocal()
-
-    session = (
-        db.query(ExamSession)
-        .filter(ExamSession.id == session_id)
-        .first()
-    )
-
-    if session is None:
-        db.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found"
-        )
-
-    if (
-        current_user["role"] != "admin"
-        and session.student_id != int(current_user["sub"])
-    ):
-        db.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to end this session"
-        )
-
+@app.delete("/api/v1/sessions/{session_id}", response_model=SessionEndResponse, tags=["sessions"])
+def end_session(session_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = _get_session_for_user(session_id, current_user, db)
+    if session.status != "ACTIVE":
+        return {"session_id": session.id, "status": session.status, "end_time": session.end_time}
     session.status = "COMPLETED"
     session.end_time = datetime.now(UTC)
-
+    _close_open_violations(db, session.id, session.end_time)
     db.commit()
+    return {"session_id": session.id, "status": session.status, "end_time": session.end_time}
 
-    result = {
-        "session_id": session.id,
-        "status": session.status,
-        "end_time": session.end_time
-    }
-
-    db.close()
-
-    return result
-
-
-# ============================================================
-# SINGLE FRAME DETECTION API
-# ============================================================
 
 @app.post("/api/v1/detect")
-async def detect_frame(
-    file: UploadFile = File(...),
-    current_user=Depends(get_current_user)
-):
+async def detect_frame(file: UploadFile = File(...), _: User = Depends(get_current_user)):
     contents = await file.read()
-
-    frame = cv2.imdecode(
-        np.frombuffer(contents, dtype=np.uint8),
-        cv2.IMREAD_COLOR
-    )
-
+    if len(contents) > MAX_FRAME_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large")
+    frame = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image"
-        )
+        raise HTTPException(status_code=400, detail="Invalid image")
 
     detector = Detector()
-
     try:
-        processed_frame, data = detector.process_frame(frame)
-
-        _, buffer = cv2.imencode(
-            ".jpg",
-            processed_frame
-        )
-
-        data["frame"] = base64.b64encode(
-            buffer
-        ).decode("utf-8")
-
+        processed_frame, data = await asyncio.to_thread(detector.process_frame, frame)
+        ok, buffer = cv2.imencode(".jpg", processed_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to encode result")
+        data["frame"] = base64.b64encode(buffer).decode("ascii")
         return data
-
     finally:
         detector.close()
 
 
-# ============================================================
-# EVENTS
-# ============================================================
-
-@app.get("/api/v1/events/{session_id}")
-def get_events(
-    session_id: int,
-    current_user=Depends(get_current_user)
-):
-    db = SessionLocal()
-
-    session = (
-        db.query(ExamSession)
-        .filter(ExamSession.id == session_id)
-        .first()
-    )
-
-    if session is None:
-        db.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found"
-        )
-
-    if (
-        current_user["role"] != "admin"
-        and session.student_id != int(current_user["sub"])
-    ):
-        db.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to view this session"
-        )
-
-    violations = (
-        db.query(Violation)
-        .filter(Violation.session_id == session_id)
-        .order_by(Violation.timestamp.asc())
-        .all()
-    )
-
-    result = []
-
-    for violation in violations:
-        result.append({
-            "id": violation.id,
-            "type": violation.violation_type,
-            "confidence": violation.confidence,
-            "timestamp": violation.timestamp
-        })
-
-    db.close()
-
+@app.get("/api/v1/events/{session_id}", response_model=EventsResponse, tags=["events"])
+def get_events(session_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _get_session_for_user(session_id, current_user, db)
+    violations = db.query(Violation).filter(Violation.session_id == session_id).order_by(Violation.timestamp.asc()).all()
     return {
         "session_id": session_id,
-        "event_count": len(result),
-        "events": result
+        "event_count": len(violations),
+        "events": [
+            {
+                "id": v.id,
+                "type": v.violation_type,
+                "confidence": v.confidence,
+                "timestamp": v.timestamp,
+                "duration_seconds": v.duration_seconds,
+                "details": v.details,
+            }
+            for v in violations
+        ],
     }
 
 
-# ============================================================
-# REPORT
-# ============================================================
-
-@app.get("/api/v1/reports/{session_id}")
-def get_report(
-    session_id: int,
-    current_user=Depends(get_current_user)
-):
-    db = SessionLocal()
-
-    session = (
-        db.query(ExamSession)
-        .options(joinedload(ExamSession.student))
-        .filter(ExamSession.id == session_id)
-        .first()
-    )
-
+@app.get("/api/v1/reports/{session_id}", response_model=ReportResponse, tags=["reports"])
+def get_report(session_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = db.query(ExamSession).options(joinedload(ExamSession.student)).filter(ExamSession.id == session_id).first()
     if session is None:
-        db.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+    if current_user.role != "admin" and session.student_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this report")
 
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found"
-        )
-
-    if (
-        current_user["role"] != "admin"
-        and session.student_id != int(current_user["sub"])
-    ):
-        db.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to view this report"
-        )
-
-    violations = (
-        db.query(Violation)
-        .filter(Violation.session_id == session_id)
-        .all()
-    )
-
+    violations = db.query(Violation).filter(Violation.session_id == session_id).all()
     violation_counts = {}
+    for v in violations:
+        violation_counts[v.violation_type] = violation_counts.get(v.violation_type, 0) + 1
 
-    for violation in violations:
-
-        violation_type = violation.violation_type
-
-        clean_type = violation_type.replace(
-            "FLAGGED: ",
-            ""
-        )
-
-        violation_counts[clean_type] = (
-            violation_counts.get(clean_type, 0) + 1
-        )
-
-    duration_seconds = None
-
-    if session.start_time:
-
-        end_time = (
-            session.end_time
-            or datetime.now(UTC)
-        )
-
-        duration_seconds = int(
-            (
-                end_time - session.start_time
-            ).total_seconds()
-        )
-
-    total_violations = len(violations)
-
-    risk_score = min(
-        total_violations * 10,
-        100
-    )
-
-    if risk_score >= 70:
-        risk_level = "HIGH"
-
-    elif risk_score >= 30:
-        risk_level = "MEDIUM"
-
-    else:
-        risk_level = "LOW"
-
-    result = {
+    start_utc = _to_utc(session.start_time)
+    end_utc = _to_utc(session.end_time) or datetime.now(UTC)
+    duration = int((end_utc - start_utc).total_seconds()) if start_utc else None
+    return {
         "session_id": session.id,
         "student": session.student.name,
         "student_email": session.student.email,
         "status": session.status,
         "start_time": session.start_time,
         "end_time": session.end_time,
-        "duration_seconds": duration_seconds,
-        "total_violations": total_violations,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "violations": violation_counts
+        "duration_seconds": duration,
+        "total_violations": len(violations),
+        "violations": violation_counts,
+        "risk_score": None,
+        "risk_level": None,
+        "risk_note": "No composite cheating score is assigned; violations are reported as observed events.",
     }
 
-    db.close()
 
-    return result
-
-
-# ============================================================
-# VIOLATIONS
-# ============================================================
-
-@app.get("/api/v1/sessions/{session_id}/violations")
-def get_violations(
-    session_id: int,
-    current_user=Depends(require_admin)
-):
-    db = SessionLocal()
-
-    violations = (
-        db.query(Violation)
-        .filter(Violation.session_id == session_id)
-        .all()
-    )
-
-    result = []
-
-    for violation in violations:
-        result.append({
-            "id": violation.id,
-            "type": violation.violation_type,
-            "confidence": violation.confidence,
-            "timestamp": violation.timestamp
-        })
-
-    db.close()
-
-    return result
+@app.get("/api/v1/sessions/{session_id}/violations", response_model=list[ViolationItem], tags=["admin"])
+def get_violations(session_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)):
+    session = db.query(ExamSession.id).filter(ExamSession.id == session_id).first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    violations = db.query(Violation).filter(Violation.session_id == session_id).order_by(Violation.timestamp.asc()).all()
+    return [
+        {
+            "id": v.id,
+            "type": v.violation_type,
+            "confidence": v.confidence,
+            "timestamp": v.timestamp,
+            "duration_seconds": v.duration_seconds,
+            "details": v.details,
+        }
+        for v in violations
+    ]
 
 
-# ============================================================
-# STATISTICS
-# ============================================================
-
-@app.get("/statistics")
-def get_statistics(
-    current_user=Depends(require_admin)
-):
-    db = SessionLocal()
-
-    total_sessions = (
-        db.query(ExamSession).count()
-    )
-
-    total_violations = (
-        db.query(Violation).count()
-    )
-
-    phone_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("PHONE")
-        )
-        .count()
-    )
-
-    no_face_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("NO FACE")
-        )
-        .count()
-    )
-
-    multiple_face_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("MULTIPLE")
-        )
-        .count()
-    )
-
-    looking_left_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("LOOKING LEFT")
-        )
-        .count()
-    )
-
-    looking_right_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("LOOKING RIGHT")
-        )
-        .count()
-    )
-
-    looking_up_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("LOOKING UP")
-        )
-        .count()
-    )
-
-    looking_down_count = (
-        db.query(Violation)
-        .filter(
-            Violation.violation_type.contains("LOOKING DOWN")
-        )
-        .count()
-    )
-
-    db.close()
-
+@app.get("/statistics", response_model=StatisticsResponse, tags=["admin"])
+def get_statistics(_: User = Depends(require_admin), db: Session = Depends(get_db)):
+    total_sessions = db.query(ExamSession).count()
+    total_violations = db.query(Violation).count()
+    def count_like(value: str) -> int:
+        return db.query(Violation).filter(Violation.violation_type.contains(value)).count()
     return {
         "total_sessions": total_sessions,
         "total_violations": total_violations,
-        "phone_detections": phone_count,
-        "no_face_detections": no_face_count,
-        "multiple_face_detections": multiple_face_count,
-        "looking_left": looking_left_count,
-        "looking_right": looking_right_count,
-        "looking_up": looking_up_count,
-        "looking_down": looking_down_count
+        "phone_detections": count_like("MOBILE PHONE"),
+        "no_face_detections": count_like("NO FACE"),
+        "multiple_face_detections": count_like("MULTIPLE"),
+        "looking_left": count_like("LOOKING LEFT"),
+        "looking_right": count_like("LOOKING RIGHT"),
+        "looking_up": count_like("LOOKING UP"),
+        "looking_down": count_like("LOOKING DOWN"),
     }
 
 
-# ============================================================
-# WEBSOCKET PROCTORING
-# ============================================================
+async def _authenticate_websocket(websocket: WebSocket) -> User | None:
+    """Authenticate with a first JSON message so the JWT is not placed in the URL."""
+    try:
+        message = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+    except (asyncio.TimeoutError, ValueError):
+        return None
+    if message.get("type") != "auth" or not message.get("token"):
+        return None
+    payload = decode_access_token(message["token"])
+    if payload is None:
+        return None
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(User.id == user_id, User.is_active == 1).first()
+    finally:
+        db.close()
+
 
 @app.websocket("/ws/{session_id}")
-async def proctor_stream(
-    websocket: WebSocket,
-    session_id: str,
-    token: str
-):
-    """
-    Real-time proctoring stream.
-
-    The session_id must correspond to an existing
-    ExamSession created through POST /api/v1/sessions.
-    """
-
+async def proctor_stream(websocket: WebSocket, session_id: int):
     await websocket.accept()
 
-    payload = verify_access_token(token)
-
-    if payload is None:
-        await websocket.close(code=1008)
+    user = await _authenticate_websocket(websocket)
+    if user is None:
+        await websocket.close(code=1008, reason="Authentication required")
         return
 
-    logger.info(
-        f"Session {session_id} connected"
-    )
-
-    detector = Detector()
     db = SessionLocal()
-
-    # --------------------------------------------------------
-    # FIND EXISTING SESSION
-    # --------------------------------------------------------
-
-    try:
-        session_id_int = int(session_id)
-    except ValueError:
-        db.close()
-        detector.close()
-
-        await websocket.close(code=1008)
-        return
-
-    exam_session = (
-        db.query(ExamSession)
-        .filter(
-            ExamSession.id == session_id_int
-        )
-        .first()
-    )
-
-    if exam_session is None:
-        logger.warning(
-            f"Session {session_id} does not exist"
-        )
-
-        db.close()
-        detector.close()
-
-        await websocket.close(code=1008)
-        return
-
-    # --------------------------------------------------------
-    # CHECK OWNERSHIP
-    # --------------------------------------------------------
-
-    if (
-        payload["role"] != "admin"
-        and exam_session.student_id != int(payload["sub"])
-    ):
-        logger.warning(
-            f"Unauthorized access to session {session_id}"
-        )
-
-        db.close()
-        detector.close()
-
-        await websocket.close(code=1008)
-        return
-
-    # --------------------------------------------------------
-    # VIOLATION COOLDOWN
-    # --------------------------------------------------------
-
-    last_logged = {}
-
-    COOLDOWN_SECONDS = 5
-
-    # --------------------------------------------------------
-    # PROCESS FRAMES
-    # --------------------------------------------------------
+    detector = None
+    receiver_task = None
+    processor_task = None
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+    stop_event = asyncio.Event()
+    violation_engine = ViolationEngine(start_frames=2, clear_frames=3)
 
     try:
-
-        while True:
-
-            raw_bytes = (
-                await websocket.receive_bytes()
-            )
-
-            logger.info(
-                f"Session {session_id}: "
-                f"received frame ({len(raw_bytes)} bytes)"
-            )
-
-            frame = cv2.imdecode(
-                np.frombuffer(
-                    raw_bytes,
-                    dtype=np.uint8
-                ),
-                cv2.IMREAD_COLOR
-            )
-
-            if frame is None:
-
-                await websocket.send_json({
-                    "error": "invalid frame"
-                })
-
-                continue
-
-            try:
-
-                processed_frame, data = (
-                    detector.process_frame(frame)
-                )
-
-            except Exception:
-
-                logger.exception(
-                    f"Session {session_id}: "
-                    f"frame processing failed"
-                )
-
-                await websocket.send_json({
-                    "error": "frame processing failed"
-                })
-
-                continue
-
-            # ------------------------------------------------
-            # ENCODE PROCESSED FRAME
-            # ------------------------------------------------
-
-            _, buffer = cv2.imencode(
-                ".jpg",
-                processed_frame
-            )
-
-            data["frame"] = base64.b64encode(
-                buffer
-            ).decode("utf-8")
-
-            # ------------------------------------------------
-            # LOG VIOLATIONS
-            # ------------------------------------------------
-
-            status = data.get(
-                "status",
-                ""
-            )
-
-            if status.startswith("FLAGGED"):
-
-                now = datetime.now(UTC)
-
-                should_log = (
-                    status not in last_logged
-                    or
-                    (
-                        now - last_logged[status]
-                    ).total_seconds()
-                    >= COOLDOWN_SECONDS
-                )
-
-                if should_log:
-
-                    violation = Violation(
-                        session_id=exam_session.id,
-                        violation_type=status,
-                        confidence=1.0,
-                        timestamp=now
-                    )
-
-                    db.add(violation)
-                    db.commit()
-
-                    last_logged[status] = now
-
-            # ------------------------------------------------
-            # SEND RESULT
-            # ------------------------------------------------
-
-            await websocket.send_json(data)
-
-    except WebSocketDisconnect:
-
-        logger.info(
-            f"Session {session_id} disconnected"
-        )
-
-    except Exception:
-
-        logger.error(
-            f"Session {session_id} crashed:\n"
-            f"{traceback.format_exc()}"
-        )
+        exam_session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
+        if exam_session is None:
+            await websocket.close(code=1008, reason="Session not found")
+            return
+        if user.role != "admin" and exam_session.student_id != user.id:
+            await websocket.close(code=1008, reason="Not authorized")
+            return
+        if exam_session.status != "ACTIVE":
+            await websocket.close(code=1008, reason="Session is not active")
+            return
 
         try:
-            await websocket.close(
-                code=1011
-            )
+            detector = await asyncio.to_thread(Detector)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Detector initialisation failed for session %s", session_id)
+            await websocket.send_json({"type": "error", "code": "detector_init", "message": str(exc)[:300]})
+            await websocket.close(code=1011, reason="Detector unavailable")
+            return
+        LIVE_SESSIONS.add(session_id)
+        await websocket.send_json({"type": "ready", "session_id": session_id})
 
+        async def receive_frames():
+            while not stop_event.is_set():
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(msg.get("code", 1000))
+                raw = msg.get("bytes")
+                if raw is None:
+                    await websocket.send_json({"type": "error", "code": "binary_only", "message": "Send JPEG frames as binary messages"})
+                    continue
+                if len(raw) > MAX_FRAME_BYTES:
+                    await websocket.send_json({"type": "error", "code": "frame_too_large", "error": "frame too large", "max_bytes": MAX_FRAME_BYTES})
+                    continue
+                if queue.full():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await queue.put(raw)
+
+        async def process_frames():
+            last_process = 0.0
+            min_interval = 0.15  # target <= ~6.7 processed frames/sec per session
+            failures = 0
+            while not stop_event.is_set():
+                raw = await queue.get()
+                now_mono = asyncio.get_running_loop().time()
+                remaining = min_interval - (now_mono - last_process)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                last_process = asyncio.get_running_loop().time()
+
+                frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    await websocket.send_json({"type": "error", "code": "invalid_frame", "error": "invalid frame"})
+                    continue
+
+                try:
+                    processed_frame, data = await asyncio.to_thread(detector.process_frame, frame)
+                    failures = 0
+                except Exception as exc:  # noqa: BLE001
+                    failures += 1
+                    logger.exception("process_frame failed (%d consecutive) for session %s", failures, session_id)
+                    await websocket.send_json({"type": "error", "code": "processing_failed", "message": f"{type(exc).__name__}: {exc}"[:300]})
+                    if failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
+                        raise RuntimeError("detector keeps failing") from exc
+                    continue
+                logger.debug("WS processed frame: status=%s", data.get("status"))
+                now = datetime.now(UTC)
+                started_events, ended_events = violation_engine.update(data, now)
+
+                for event in started_events:
+                    row = Violation(
+                        session_id=exam_session.id,
+                        violation_type=event.violation_type,
+                        confidence=event.confidence,
+                        timestamp=event.started_at,
+                        details=event.details,
+                    )
+                    db.add(row)
+                if started_events:
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        logger.exception("Failed to commit started violations for session %s", session_id)
+
+                for event in ended_events:
+                    started_utc = _to_utc(event.started_at)
+                    dur = max(0.0, (now - started_utc).total_seconds()) if started_utc else 0.0
+                    # Match the currently active DB event by type and open duration.
+                    row = (
+                        db.query(Violation)
+                        .filter(
+                            Violation.session_id == exam_session.id,
+                            Violation.violation_type == event.violation_type,
+                            Violation.duration_seconds.is_(None),
+                        )
+                        .order_by(Violation.id.desc())
+                        .first()
+                    )
+                    if row is not None:
+                        row.duration_seconds = dur
+                        row.details = event.details
+                if ended_events:
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        logger.exception("Failed to commit ended violations for session %s", session_id)
+
+                ok, buffer = cv2.imencode(".jpg", processed_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if not ok:
+                    await websocket.send_json({"type": "error", "code": "encode_failed", "error": "failed to encode frame"})
+                    continue
+                data["frame"] = base64.b64encode(buffer).decode("ascii")
+                data["type"] = "detection"
+                await websocket.send_json(data)
+
+        receiver_task = asyncio.create_task(receive_frames())
+        processor_task = asyncio.create_task(process_frames())
+        done, pending = await asyncio.wait(
+            {receiver_task, processor_task},
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        for task in done:
+            exc = task.exception()
+            if exc and not isinstance(exc, WebSocketDisconnect):
+                raise exc
+        stop_event.set()
+        for task in pending:
+            task.cancel()
+
+    except WebSocketDisconnect:
+        logger.info("Session %s disconnected", session_id)
+    except Exception:
+        logger.exception("Session %s websocket failed", session_id)
+        try:
+            await websocket.close(code=1011, reason="Internal server error")
         except RuntimeError:
             pass
-
     finally:
-
-        if db:
+        LIVE_SESSIONS.discard(session_id)
+        stop_event.set()
+        for task in (receiver_task, processor_task):
+            if task and not task.done():
+                task.cancel()
+        if detector:
+            detector.close()
+        now = datetime.now(UTC)
+        try:
+            ended_events = violation_engine.finalize(now)
+            for event in ended_events:
+                started_utc = _to_utc(event.started_at)
+                dur = max(0.0, (now - started_utc).total_seconds()) if started_utc else 0.0
+                row = (
+                    db.query(Violation)
+                    .filter(
+                        Violation.session_id == session_id,
+                        Violation.violation_type == event.violation_type,
+                        Violation.duration_seconds.is_(None),
+                    )
+                    .order_by(Violation.id.desc())
+                    .first()
+                )
+                if row is not None:
+                    row.duration_seconds = dur
+                    row.details = event.details
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Error finalizing events for session %s", session_id)
+        finally:
             db.close()
-
-        detector.close()
-
-        logger.info(
-            f"Session {session_id} WebSocket cleanup complete"
-        )
+            logger.info("Session %s WebSocket cleanup complete", session_id)

@@ -1,348 +1,640 @@
+
+from __future__ import annotations
+
+import logging
+from collections import deque
+from threading import RLock
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import time
-from collections import deque
-from ultralytics import YOLO
+
+from . import config
+from .model_manager import model_manager
+from .pose import (
+    CalibrationConfig,
+    Calibrator,
+    DirectionClassifier,
+    DirectionConfig,
+    pose_from_landmarks,
+)
+
+logger = logging.getLogger("proctor.detector")
+
+
+def _require_face_mesh():
+    solutions = getattr(mp, "solutions", None)
+
+    if solutions is None or not hasattr(solutions, "face_mesh"):
+        raise RuntimeError(
+            f"Installed mediapipe {getattr(mp, '__version__', '?')} "
+            "does not expose solutions.face_mesh. Use "
+            "mediapipe==0.10.14 with numpy<2."
+        )
+
+    return solutions.face_mesh
+
+
+def _cfg(name, default):
+    return getattr(config, name, default)
 
 
 class Detector:
-
-    # Class-level constants (shared, not rebuilt per instance)
     GREEN = (0, 255, 0)
     RED = (0, 0, 255)
     BLUE = (255, 0, 0)
     YELLOW = (0, 255, 255)
 
-    FACE_IDS = (33, 263, 1, 61, 291, 199)
-
-    MODEL_POINTS = np.array([
-        (-30.0, -30.0, -30.0),
-        (30.0, -30.0, -30.0),
-        (0.0, 0.0, 0.0),
-        (-25.0, 30.0, -20.0),
-        (25.0, 30.0, -20.0),
-        (0.0, 65.0, -5.0)
-    ], dtype=np.float64)
-
-    DIST_COEFFS = np.zeros((4, 1))
-
-    SMOOTHING = 5
-    YAW_THRESHOLD = 18
-    LOOK_DOWN_THRESHOLD =42 # Increase this if it flags too easily
-    LOOK_UP_THRESHOLD = 25
-    CALIBRATION_SECONDS = 3.0
+    SMOOTHING = 3
+    PHONE_EVERY_N_FRAMES = 3
 
     def __init__(self):
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
+        self.face_mesh = _require_face_mesh().FaceMesh(
             static_image_mode=False,
             max_num_faces=2,
             refine_landmarks=True,
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
         )
-        
-        self.yolo = YOLO("yolov8n.pt")
-        
+
         self.frame_counter = 0
         self.last_phones = []
 
-        # Fixed-size ring buffers: O(1) append/evict instead of list + pop(0)
         self.pitch_history = deque(maxlen=self.SMOOTHING)
         self.yaw_history = deque(maxlen=self.SMOOTHING)
         self.roll_history = deque(maxlen=self.SMOOTHING)
 
-        # Camera matrix depends only on frame size — cache it instead of
-        # rebuilding a fresh matrix every single frame
-        self._cached_dims = None
-        self._cached_camera_matrix = None
+        self.calibrator = Calibrator(
+            CalibrationConfig(
+                samples_needed=int(
+                    _cfg("CALIBRATION_SAMPLES", 20)
+                ),
+                max_abs_pitch=50.0,
+                max_abs_yaw=20.0,
+                max_abs_roll=25.0,
+                timeout_seconds=20.0,
+            )
+        )
 
-        # -------------------------
-        # CALIBRATION
-        # -------------------------
-        # Different webcams/desk heights/monitor angles all produce a
-        # different "neutral" pitch and yaw for the same person looking
-        # straight at the screen. A fixed threshold can't account for
-        # that, so instead we sample the first few seconds of a session,
-        # average them into a baseline, and compare everything after
-        # that relative to the baseline instead of to zero.
-        self.calibrated = False
-        self.calibration_start = None
-        self.calibration_pitch_samples = []
-        self.calibration_yaw_samples = []
-        self.baseline_pitch = 0.0
-        self.baseline_yaw = 0.0
+        self.directions = DirectionClassifier(
+            DirectionConfig(
+                yaw_threshold=float(
+                    _cfg("YAW_THRESHOLD_DEG", 20.0)
+                ),
+                up_threshold=float(
+                    _cfg("LOOK_UP_THRESHOLD_DEG", 18.0)
+                ),
+                down_threshold=float(
+                    _cfg("LOOK_DOWN_THRESHOLD_DEG", 15.0)
+                ),
+                hysteresis_ratio=0.7,
+                enter_frames=int(
+                    _cfg("DIRECTION_ENTER_FRAMES", 3)
+                ),
+                clear_frames=int(
+                    _cfg("DIRECTION_CLEAR_FRAMES", 3)
+                ),
+            )
+        )
 
-    # -------------------------
-    # CAMERA MATRIX
-    # -------------------------
+        self.calibration_started_at = None
+        self._closed = False
+        self._lock = RLock()
 
-    def get_camera_matrix(self, width, height):
-        if self._cached_dims != (width, height):
-            focal_length = width
-            center = (width / 2, height / 2)
+    @property
+    def calibrated(self):
+        return self.calibrator.done
 
-            self._cached_camera_matrix = np.array([
-                [focal_length, 0, center[0]],
-                [0, focal_length, center[1]],
-                [0, 0, 1]
-            ], dtype=np.float64)
+    @property
+    def baseline_pitch(self):
+        return self.calibrator.baseline_pitch
 
-            self._cached_dims = (width, height)
+    @property
+    def baseline_yaw(self):
+        return self.calibrator.baseline_yaw
 
-        return self._cached_camera_matrix, self.DIST_COEFFS
+    def reset_calibration(self):
+        with self._lock:
+            self.calibrator.reset()
+            self.directions.reset()
 
-    # -------------------------
-    # HEAD POSE
-    # -------------------------
+            self.pitch_history.clear()
+            self.yaw_history.clear()
+            self.roll_history.clear()
+
+            self.calibration_started_at = None
 
     def estimate_head_pose(self, landmarks, frame_shape):
-        h, w = frame_shape[:2]
+        height, width = frame_shape[:2]
 
-        image_points = np.array(
-            [[landmarks[idx].x * w, landmarks[idx].y * h] for idx in self.FACE_IDS],
-            dtype=np.float64
+        return pose_from_landmarks(
+            landmarks,
+            width,
+            height,
         )
 
-        camera_matrix, dist = self.get_camera_matrix(w, h)
-
-        success, rotation_vector, translation_vector = cv2.solvePnP(
-            self.MODEL_POINTS,
-            image_points,
-            camera_matrix,
-            dist,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-
-        if not success:
-            return None
-
-        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        projection_matrix = np.hstack((rotation_matrix, translation_vector))
-
-        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(projection_matrix)
-
-        pitch = float(euler_angles[0])
-        yaw = float(euler_angles[1])
-        roll = float(euler_angles[2])
-
-        return pitch, yaw, roll
-
-    # -------------------------
-    # FACE BOX
-    # -------------------------
-
-    def draw_face_box(self, frame, landmarks):
-        h, w = frame.shape[:2]
-
-        pts = np.array([[lm.x, lm.y] for lm in landmarks])
-        x1, y1 = (pts.min(axis=0) * [w, h]).astype(int)
-        x2, y2 = (pts.max(axis=0) * [w, h]).astype(int)
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), self.GREEN, 2)
-
-    # -------------------------
-    # DRAW TEXT
-    # -------------------------
-
-    def draw_text(self, frame, text, x, y, color):
+    @staticmethod
+    def _draw_text(
+        frame,
+        text,
+        x,
+        y,
+        color,
+        scale=0.65,
+    ):
         cv2.putText(
-            frame, text, (x, y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA
+            frame,
+            str(text),
+            (int(x), int(y)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            2,
+            cv2.LINE_AA,
         )
 
-    # -------------------------
-    # PROCESS FRAME
-    # -------------------------
-    
     def detect_phone(self, frame):
-        results = self.yolo(frame,
-                            imgsz=320,
-                            verbose=False
-                        )
-        phones = []
-        for result in results:
-            for box in result.boxes:
-                cls = int(box.cls[0])
-                # COCO class 67 = cell phone
-                if cls == 67:
-                    conf = float(box.conf[0])
-                    if conf > 0.45:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        try:
+            yolo = model_manager.get_yolo()
 
-                        phones.append({
+        except Exception:
+            logger.exception("Could not load YOLO model")
+            return []
+
+        if yolo is None:
+            return []
+
+        try:
+            with model_manager.inference_lock:
+                results = yolo(
+                    frame,
+                    imgsz=320,
+                    verbose=False,
+                )
+
+        except Exception:
+            logger.exception("YOLO phone detection failed")
+            return []
+
+        phones = []
+        names = getattr(yolo, "names", {}) or {}
+
+        threshold = float(
+            _cfg("PHONE_CONF_THRESHOLD", 0.45)
+        )
+
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+
+            if boxes is None:
+                continue
+
+            for box in boxes:
+                try:
+                    class_id = int(box.cls[0])
+
+                    if isinstance(names, dict):
+                        class_name = names.get(class_id)
+                    else:
+                        class_name = names[class_id]
+
+                    confidence = float(box.conf[0])
+
+                    if class_name != "cell phone":
+                        continue
+
+                    if confidence < threshold:
+                        continue
+
+                    coords = (
+                        np.asarray(box.xyxy[0])
+                        .reshape(-1)[:4]
+                    )
+
+                    x1, y1, x2, y2 = map(int, coords)
+
+                    phones.append(
+                        {
                             "bbox": (x1, y1, x2, y2),
-                            "confidence": conf
-                        })
-                        
+                            "confidence": confidence,
+                        }
+                    )
+
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    logger.debug(
+                        "Skipping malformed YOLO detection"
+                    )
+
         return phones
 
     def process_frame(self, frame):
-        frame = cv2.flip(frame, 1)
-        self.frame_counter += 1
-        if self.frame_counter % 3 == 0:
-            self.last_phones = self.detect_phone(frame)
-        phones = self.last_phones
-        phone_detected = len(phones) > 0
-        for phone in phones:
-            x1, y1, x2, y2 = phone["bbox"]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), self.RED, 2)
-            self.draw_text(
-                frame,
-                "PHONE",
-                x1,
-                max(20, y1 - 10),
-                self.RED
+        if (
+            frame is None
+            or not isinstance(frame, np.ndarray)
+            or frame.size == 0
+        ):
+            raise ValueError(
+                "Expected a non-empty OpenCV BGR frame"
             )
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
 
-        status = "STATUS : SECURE"
-        color = self.GREEN
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Detector is closed")
 
-        pitch = yaw = roll = 0.0
-        face_count = 0
+            # Mirror the camera frame.
+            frame = cv2.flip(frame, 1)
 
-        looking_left = looking_right = looking_down = looking_up = False
-        no_face = multiple_faces = False
+            height, width = frame.shape[:2]
 
-        if results.multi_face_landmarks is None:
-            no_face = True
-            status = "FLAGGED : NO FACE DETECTED"
-            color = self.RED
+            # Run YOLO every third frame.
+            self.frame_counter += 1
 
-        else:
-            face_count = len(results.multi_face_landmarks)
+            if (
+                self.frame_counter % self.PHONE_EVERY_N_FRAMES
+                == 0
+            ):
+                self.last_phones = self.detect_phone(frame)
 
-            if face_count > 1:
-                multiple_faces = True
-                status = "FLAGGED : MULTIPLE FACES"
+            phones = list(self.last_phones)
+            phone_detected = bool(phones)
+
+            for phone in phones:
+                x1, y1, x2, y2 = phone["bbox"]
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    self.RED,
+                    2,
+                )
+
+                self._draw_text(
+                    frame,
+                    "PHONE",
+                    x1,
+                    max(20, y1 - 8),
+                    self.RED,
+                )
+
+            rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB,
+            )
+
+            results = self.face_mesh.process(rgb)
+
+            status = "STATUS : SECURE"
+            color = self.GREEN
+
+            pitch = yaw = roll = 0.0
+            relative_pitch = relative_yaw = 0.0
+
+            face_count = 0
+            no_face = False
+            multiple_faces = False
+            pose_valid = False
+            usable_pose = False
+
+            directions = dict(self.directions.state)
+
+            if not self.calibrated:
+                self.calibrator.tick()
+
+            faces = (
+                getattr(results, "multi_face_landmarks", None)
+                or []
+            )
+
+            if not faces:
+                no_face = True
+                status = "FLAGGED : NO FACE DETECTED"
                 color = self.RED
 
-            landmarks = results.multi_face_landmarks[0].landmark
-            self.draw_face_box(frame, landmarks)
+                self.calibrator.note_invalid(
+                    "No face detected - move into view"
+                )
 
-            pose = self.estimate_head_pose(landmarks, frame.shape)
+            else:
+                face_count = len(faces)
+                multiple_faces = face_count > 1
 
-            if pose is not None:
-                pitch, yaw, roll = pose
+                if multiple_faces:
+                    status = "FLAGGED : MULTIPLE FACES"
+                    color = self.RED
 
-                # -------------------------
-                # SMOOTHING (deque handles maxlen eviction automatically)
-                # -------------------------
-                self.pitch_history.append(pitch)
-                self.yaw_history.append(yaw)
-                self.roll_history.append(roll)
+                    self.calibrator.note_invalid(
+                        "Only one person may be in view"
+                    )
 
-                pitch = sum(self.pitch_history) / len(self.pitch_history)
-                yaw = sum(self.yaw_history) / len(self.yaw_history)
-                roll = sum(self.roll_history) / len(self.roll_history)
+                landmarks = faces[0].landmark
 
-                # -------------------------
-                # CALIBRATION
-                # -------------------------
-                if not self.calibrated:
-                    if self.calibration_start is None:
-                        self.calibration_start = time.time()
+                # Draw face bounding rectangle.
+                points = np.asarray(
+                    [
+                        (lm.x * width, lm.y * height)
+                        for lm in landmarks
+                    ],
+                    dtype=np.float32,
+                )
 
-                    self.calibration_pitch_samples.append(pitch)
-                    self.calibration_yaw_samples.append(yaw)
+                if points.size:
+                    x1, y1 = (
+                        np.min(points, axis=0).astype(int)
+                    )
 
-                    elapsed = time.time() - self.calibration_start
+                    x2, y2 = (
+                        np.max(points, axis=0).astype(int)
+                    )
 
-                    if elapsed >= self.CALIBRATION_SECONDS:
-                        self.baseline_pitch = (
-                            sum(self.calibration_pitch_samples)
-                            / len(self.calibration_pitch_samples)
-                        )
-                        self.baseline_yaw = (
-                            sum(self.calibration_yaw_samples)
-                            / len(self.calibration_yaw_samples)
-                        )
-                        self.calibrated = True
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(width - 1, x2)
+                    y2 = min(height - 1, y2)
 
-                    status = "CALIBRATING..."
-                    color = self.YELLOW
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        self.GREEN,
+                        2,
+                    )
+
+                # Estimate head pose on EVERY frame.
+                pose = self.estimate_head_pose(
+                    landmarks,
+                    frame.shape,
+                )
+
+                if (
+                    pose is None
+                    or len(pose) != 3
+                    or not np.all(np.isfinite(pose))
+                ):
+                    self.calibrator.note_invalid(
+                        "Cannot estimate head pose - improve lighting"
+                    )
 
                 else:
-                    # Compare against this session's own neutral pose,
-                    # not against zero — this is what makes the
-                    # thresholds work across different webcams/desks.
-                    relative_pitch = pitch - self.baseline_pitch
-                    relative_yaw = yaw - self.baseline_yaw
+                    pose_valid = True
 
-                    # -------------------------
-                    # HEAD DIRECTION
-                    # -------------------------
-                    if relative_yaw < -self.YAW_THRESHOLD:
-                        looking_left = True
-                        status = "FLAGGED : LOOKING LEFT"
-                        color = self.RED
+                    raw_pitch, raw_yaw, raw_roll = map(
+                        float,
+                        pose,
+                    )
 
-                    elif relative_yaw > self.YAW_THRESHOLD:
-                        looking_right = True
-                        status = "FLAGGED : LOOKING RIGHT"
-                        color = self.RED
+                    self.pitch_history.append(raw_pitch)
+                    self.yaw_history.append(raw_yaw)
+                    self.roll_history.append(raw_roll)
 
-                    elif relative_pitch < -self.LOOK_DOWN_THRESHOLD:
-                        looking_down = True
-                        status = "FLAGGED : LOOKING DOWN"
-                        color = self.RED
-                        # Looking UP (optional)
-                    elif relative_pitch > self.LOOK_UP_THRESHOLD:
-                        looking_up = True
-                        status = "FLAGGED : LOOKING UP"
-                        color = self.RED
+                    pitch = float(
+                        np.mean(self.pitch_history)
+                    )
+
+                    yaw = float(
+                        np.mean(self.yaw_history)
+                    )
+
+                    roll = float(
+                        np.mean(self.roll_history)
+                    )
+
+                    # Calibrate only with exactly one detected face.
+                    if (
+                        not self.calibrated
+                        and not multiple_faces
+                    ):
+                        if self.calibration_started_at is None:
+                            import time
+
+                            self.calibration_started_at = (
+                                time.monotonic()
+                            )
+
+                        self.calibrator.add(
+                            pitch,
+                            yaw,
+                            roll,
+                        )
+
+                    if not self.calibrated:
+                        if not multiple_faces:
+                            status = "CALIBRATING..."
+                            color = self.YELLOW
 
                     else:
-                        status = "STATUS : SECURE"
-                        color = self.GREEN
+                        relative_pitch = (
+                            pitch
+                            - self.calibrator.baseline_pitch
+                        )
 
-                # -------------------------
-                # DRAW LANDMARKS
-                # -------------------------
-                h, w = frame.shape[:2]
+                        relative_yaw = (
+                            yaw
+                            - self.calibrator.baseline_yaw
+                        )
 
-                for idx in self.FACE_IDS:
-                    lm = landmarks[idx]
-                    x = int(lm.x * w)
-                    y = int(lm.y * h)
-                    cv2.circle(frame, (x, y), 4, self.BLUE, -1)
-        if phone_detected:
-            status = "FLAGGED : MOBILE PHONE DETECTED"
-            color = self.RED
+                        if not multiple_faces:
+                            usable_pose = True
 
-        # -------------------------
-        # DRAW STATUS
-        # -------------------------
-        self.draw_text(frame, status, 20, 35, color)
-        self.draw_text(frame, f"Pitch : {pitch:.1f}", 20, 70, self.GREEN)
-        self.draw_text(frame, f"Yaw : {yaw:.1f}", 20, 105, self.GREEN)
-        self.draw_text(frame, f"Roll : {roll:.1f}", 20, 140, self.GREEN)
+                            directions = (
+                                self.directions.update(
+                                    relative_pitch,
+                                    relative_yaw,
+                                )
+                            )
 
-        data = {
-            "status": status,
-            "pitch": pitch,
-            "yaw": yaw,
-            "roll": roll,
-            "face_count": face_count,
-            "looking_left": looking_left,
-            "looking_right": looking_right,
-            "looking_down": looking_down,
-            "looking_up": looking_up,
-            "no_face": no_face,
-            "multiple_faces": multiple_faces,
-            "phone_detected": phone_detected,
-            "phone_count": len(phones),
-            "calibrated": self.calibrated
-        }
+                        if (
+                            any(directions.values())
+                            and not multiple_faces
+                        ):
+                            label = (
+                                "LEFT"
+                                if directions["left"]
+                                else "RIGHT"
+                                if directions["right"]
+                                else "UP"
+                                if directions["up"]
+                                else "DOWN"
+                            )
 
-        return frame, data
+                            status = (
+                                f"FLAGGED : LOOKING {label}"
+                            )
 
-    # -------------------------
-    # CLEANUP
-    # -------------------------
+                            color = self.RED
+
+                # Draw the six landmarks used by pose.py.
+                for index in (
+                    33,
+                    263,
+                    1,
+                    61,
+                    291,
+                    199,
+                ):
+                    if index < len(landmarks):
+                        lm = landmarks[index]
+
+                        px = int(lm.x * width)
+                        py = int(lm.y * height)
+
+                        cv2.circle(
+                            frame,
+                            (px, py),
+                            3,
+                            self.BLUE,
+                            -1,
+                        )
+
+            # Invalid frames cannot create new violations.
+            if not usable_pose:
+                directions = self.directions.hold()
+
+            looking_left = bool(directions["left"])
+            looking_right = bool(directions["right"])
+            looking_up = bool(directions["up"])
+            looking_down = bool(directions["down"])
+
+            no_valid_pose = (
+                face_count >= 1 and not pose_valid
+            )
+
+            if no_valid_pose and not multiple_faces:
+                status = "NO VALID POSE (diagnostic)"
+                color = self.YELLOW
+
+            # Phone detection takes priority in displayed status.
+            if phone_detected:
+                status = "FLAGGED : MOBILE PHONE DETECTED"
+                color = self.RED
+
+            self._draw_text(
+                frame,
+                status,
+                20,
+                32,
+                color,
+            )
+
+            self._draw_text(
+                frame,
+                f"Pitch: {pitch:.1f}",
+                20,
+                65,
+                self.GREEN,
+            )
+
+            self._draw_text(
+                frame,
+                f"Yaw: {yaw:.1f}",
+                20,
+                95,
+                self.GREEN,
+            )
+
+            self._draw_text(
+                frame,
+                f"Roll: {roll:.1f}",
+                20,
+                125,
+                self.GREEN,
+            )
+
+            self._draw_text(
+                frame,
+                (
+                    f"Relative P/Y: "
+                    f"{relative_pitch:+.1f} / "
+                    f"{relative_yaw:+.1f}"
+                ),
+                20,
+                155,
+                (
+                    self.RED
+                    if any(
+                        (
+                            looking_left,
+                            looking_right,
+                            looking_up,
+                            looking_down,
+                        )
+                    )
+                    else self.BLUE
+                ),
+                scale=0.55,
+            )
+
+            phone_confidence = max(
+                (
+                    p["confidence"]
+                    for p in phones
+                ),
+                default=None,
+            )
+
+            data = {
+                "status": status,
+                "pitch": pitch,
+                "yaw": yaw,
+                "roll": roll,
+                "relative_pitch": relative_pitch,
+                "relative_yaw": relative_yaw,
+                "face_count": face_count,
+                "looking_left": looking_left,
+                "looking_right": looking_right,
+                "looking_down": looking_down,
+                "looking_up": looking_up,
+                "no_face": no_face,
+                "no_valid_pose": no_valid_pose,
+                "multiple_faces": multiple_faces,
+                "phone_detected": phone_detected,
+                "phone_count": len(phones),
+                "phone_confidence": phone_confidence,
+                "pose_valid": pose_valid,
+                "calibrated": self.calibrated,
+                "calibration_progress": (
+                    self.calibrator.progress
+                ),
+                "calibration_message": (
+                    self.calibrator.message
+                ),
+                "calibration_timed_out": (
+                    self.calibrator.timed_out
+                ),
+                "calibration_attempts": (
+                    self.calibrator.attempts
+                ),
+                "baseline_pitch": (
+                    self.calibrator.baseline_pitch
+                    if self.calibrated
+                    else None
+                ),
+                "baseline_yaw": (
+                    self.calibrator.baseline_yaw
+                    if self.calibrated
+                    else None
+                ),
+            }
+
+            return frame, data
 
     def close(self):
-        self.face_mesh.close()
+        with self._lock:
+            if self._closed:
+                return
+
+            self._closed = True
+
+            try:
+                self.face_mesh.close()
+
+            except Exception:
+                logger.exception(
+                    "Error closing MediaPipe FaceMesh"
+                )

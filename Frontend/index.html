@@ -413,688 +413,163 @@
 
 
 <script>
-
-  const WS_URL_BASE =
-    'ws://localhost:8000/ws/';
-
-
-  const startBtn =
-    document.getElementById('startBtn');
-
-  const canvas =
-    document.getElementById('feed');
-
-  const ctx =
-    canvas.getContext('2d');
-
-
-  const placeholder =
-    document.getElementById('placeholder');
-
-
-  const hiddenVideo =
-    document.createElement('video');
-
-  hiddenVideo.autoplay = true;
-  hiddenVideo.playsInline = true;
-  hiddenVideo.muted = true;
-
-
-  const captureCanvas =
-    document.createElement('canvas');
-
-  captureCanvas.width = 480;
-  captureCanvas.height = 360;
-
-
-  const captureCtx =
-    captureCanvas.getContext('2d');
-
-
-  let ws = null;
-
-  let sessionId = null;
-
-  let sending = false;
-
-  let mediaStream = null;
-
-  let violationCount = 0;
-
-
-  function setConnectionState(state) {
-
-    const dot =
-      document.getElementById('connDot');
-
-    const label =
-      document.getElementById('connLabel');
-
-
-    dot.className =
-      'conn-dot ' + state;
-
-
-    if (state === 'live') {
-
-      label.textContent = 'Live';
-
-    } else if (state === 'connecting') {
-
-      label.textContent = 'Connecting…';
-
-    } else {
-
-      label.textContent = 'Offline';
-
-    }
-
-  }
-
-
-  async function startMonitoring() {
-
-    try {
-
-      mediaStream =
-        await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: 640,
-            height: 480
-          }
-        });
-
-    } catch (err) {
-
-      alert(
-        'Could not access the camera: ' +
-        err.message
-      );
-
-      return;
-
-    }
-
-
-    hiddenVideo.srcObject =
-      mediaStream;
-
-
-    await hiddenVideo.play();
-
-
-    const token =
-      localStorage.getItem('token');
-
-
-    if (!token) {
-
-      console.error(
-        'No authentication token found'
-      );
-
-      alert(
-        'Please login again.'
-      );
-
-      return;
-
-    }
-
-
-    /*
-      Create the persistent exam session
-      before opening the WebSocket.
-    */
-
-    let response;
-
-    try {
-
-      response =
-        await fetch(
-          'http://127.0.0.1:8000/api/v1/sessions',
-          {
-            method: 'POST',
-
-            headers: {
-              'Authorization':
-                `Bearer ${token}`
-            }
-          }
-        );
-
-    } catch (err) {
-
-      console.error(
-        'Session creation failed:',
-        err
-      );
-
-      alert(
-        'Could not connect to the server.'
-      );
-
-      return;
-
-    }
-
-
-    if (!response.ok) {
-
-      console.error(
-        'Failed to create exam session:',
-        response.status
-      );
-
-      alert(
-        'Could not create exam session.'
-      );
-
-      return;
-
-    }
-
-
-    const sessionData =
-      await response.json();
-
-
-    sessionId =
-      sessionData.session_id;
-
-
-    console.log(
-      'Exam session created:',
-      sessionId
-    );
-
-
-    document.getElementById(
-      'sessionIdLabel'
-    ).textContent =
-      sessionId;
-
-
-    placeholder.style.display =
-      'none';
-
-
-    canvas.style.display =
-      'block';
-
-
-    setConnectionState(
-      'connecting'
-    );
-
-
+const API_BASE = localStorage.getItem('apiBase') || 'http://127.0.0.1:8000';
+const WS_BASE = API_BASE.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+const startBtn = document.getElementById('startBtn');
+const canvas = document.getElementById('feed');
+const ctx = canvas.getContext('2d');
+const placeholder = document.getElementById('placeholder');
+const hiddenVideo = document.createElement('video');
+hiddenVideo.autoplay = true; hiddenVideo.playsInline = true; hiddenVideo.muted = true;
+const captureCanvas = document.createElement('canvas'); captureCanvas.width = 480; captureCanvas.height = 360;
+const captureCtx = captureCanvas.getContext('2d');
+let ws = null, sessionId = null, sending = false, mediaStream = null, sendTimer = null, tokenRefreshPromise = null;
+let frameBusy = false, authenticatedSocket = false, stopping = false;
+function parseJwt(token) {
+  try { const p=token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'); return JSON.parse(decodeURIComponent(escape(atob(p)))); } catch { return null; }
+}
+function clearAuth() { localStorage.removeItem('token'); localStorage.removeItem('refresh_token'); localStorage.removeItem('token_exp'); }
+async function refreshToken() {
+  if (tokenRefreshPromise) return tokenRefreshPromise;
+  tokenRefreshPromise = (async () => {
+    const refresh = localStorage.getItem('refresh_token');
+    if (!refresh) throw new Error('Your session expired. Please log in again.');
+    const r = await fetch(`${API_BASE}/refresh`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:refresh})});
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || !data.access_token || !data.refresh_token) { clearAuth(); throw new Error('Your session expired. Please log in again.'); }
+    const p = parseJwt(data.access_token);
+    localStorage.setItem('token',data.access_token); localStorage.setItem('refresh_token',data.refresh_token); localStorage.setItem('token_exp',String(p?.exp||0));
+    return data.access_token;
+  })().finally(()=>{ tokenRefreshPromise=null; });
+  return tokenRefreshPromise;
+}
+async function getValidToken() {
+  let token = localStorage.getItem('token');
+  if (!token) { location.href='login.html'; throw new Error('Please log in.'); }
+  const p = parseJwt(token);
+  if (!p || !p.exp || p.exp < Math.floor(Date.now()/1000)+30) token = await refreshToken();
+  return token;
+}
+async function apiFetch(path, options={}) {
+  let token = await getValidToken();
+  const make = t => fetch(`${API_BASE}${path}`, {...options, headers:{...(options.headers||{}),Authorization:`Bearer ${t}`}});
+  let response = await make(token);
+  if (response.status === 401) { token = await refreshToken(); response = await make(token); }
+  if (response.status === 401) { clearAuth(); location.href='login.html'; }
+  return response;
+}
+function setConnectionState(state) {
+  document.getElementById('connDot').className='conn-dot '+state;
+  document.getElementById('connLabel').textContent=state==='live'?'Live':state==='connecting'?'Connecting…':'Offline';
+}
+function setStatus(text, flagged=false) { const box=document.getElementById('statusBox'); box.textContent=text; box.className='status-box '+(flagged?'flagged':'secure'); }
+async function startMonitoring() {
+  startBtn.disabled=true;
+  try {
+    await getValidToken();
+    mediaStream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480},audio:false});
+    hiddenVideo.srcObject=mediaStream; await hiddenVideo.play();
+    const response = await apiFetch('/api/v1/sessions',{method:'POST'});
+    const sessionData = await response.json().catch(()=>({}));
+    if (!response.ok) throw new Error(sessionData.detail || 'Could not create an exam session.');
+    sessionId=sessionData.session_id;
+    document.getElementById('sessionIdLabel').textContent=String(sessionId);
+    placeholder.style.display='none'; canvas.style.display='block'; setConnectionState('connecting');
     connectSocket();
-
-
-    startBtn.textContent =
-      'Stop monitoring';
-
-
-    startBtn.onclick =
-      stopMonitoring;
-
-  }
-
-
-  function connectSocket() {
-
-    const token =
-      localStorage.getItem('token');
-
-
-    if (!token || !sessionId) {
-
-      console.error(
-        'Missing token or session ID'
-      );
-
-      return;
-
-    }
-
-
-    ws =
-      new WebSocket(
-        `${WS_URL_BASE}${sessionId}?token=${encodeURIComponent(token)}`
-      );
-
-
-    ws.onopen = () => {
-
-      console.log(
-        'WebSocket connected'
-      );
-
-
-      setConnectionState(
-        'live'
-      );
-
-
-      sending = true;
-
-
-      sendLoop();
-
-    };
-
-
-    ws.onmessage = (event) => {
-
-      let data;
-
-      try {
-
-        data =
-          JSON.parse(event.data);
-
-      } catch (err) {
-
-        console.error(
-          'Invalid server response:',
-          err
-        );
-
-        return;
-
-      }
-
-
-      if (data.error) {
-
-        console.error(
-          'Server error:',
-          data.error
-        );
-
-        return;
-
-      }
-
-
-      renderFrame(data);
-
-      updateTelemetry(data);
-
-      updateStatus(data);
-
-    };
-
-
-    ws.onclose = (event) => {
-
-      console.log(
-        'WebSocket closed:',
-        event.code,
-        event.reason
-      );
-
-
-      sending = false;
-
-
-      setConnectionState(
-        'offline'
-      );
-
-    };
-
-
-    ws.onerror = (error) => {
-
-      console.error(
-        'WebSocket error:',
-        error
-      );
-
-
-      setConnectionState(
-        'offline'
-      );
-
-    };
-
-  }
-
-
-  function sendLoop() {
-
-    if (!sending) {
+    startBtn.textContent='Stop monitoring'; startBtn.onclick=()=>stopMonitoring();
+  } catch(err) {
+    const msg = err && err.name==='NotAllowedError' ? 'Camera permission was denied. Allow camera access and try again.'
+              : err && err.name==='NotFoundError' ? 'No camera was found on this device.'
+              : (err.message || 'Could not start monitoring.');
+    setStatus(msg, true);
+    if (mediaStream) { mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+    if (sessionId) { try { await apiFetch(`/api/v1/sessions/${sessionId}`,{method:'DELETE'}); } catch {} sessionId=null; }
+    setConnectionState('offline');
+  } finally { startBtn.disabled=false; }
+}
+function connectSocket() {
+  const token=localStorage.getItem('token');
+  if (!token || !sessionId) { location.href='login.html'; return; }
+  ws=new WebSocket(`${WS_BASE}/ws/${sessionId}`); ws.binaryType='arraybuffer'; authenticatedSocket=false;
+  ws.onopen=()=>{ setConnectionState('connecting'); ws.send(JSON.stringify({type:'auth',token})); };
+  ws.onmessage=(event)=>{
+    if (typeof event.data !== 'string') return;
+    let data; try { data=JSON.parse(event.data); } catch { return; }
+    if (data.type==='ready') { authenticatedSocket=true; sending=true; setConnectionState('live'); setStatus('Calibrating camera…'); sendLoop(); return; }
+    if (data.type==='error' || data.error) {
+      // Show server-side problems instead of silently leaving a black preview.
+      const code = data.code || 'error';
+      if (code !== 'frame_too_large') setStatus(`Server error (${code}): ${data.message || data.error || 'see backend log'}`, true);
       return;
     }
-
-
-    if (
-      !ws ||
-      ws.readyState !== WebSocket.OPEN
-    ) {
-
-      return;
-
-    }
-
-
-    captureCtx.drawImage(
-      hiddenVideo,
-      0,
-      0,
-      captureCanvas.width,
-      captureCanvas.height
-    );
-
-
-    captureCanvas.toBlob(
-      (blob) => {
-
-        if (
-          !blob ||
-          !ws ||
-          ws.readyState !== WebSocket.OPEN
-        ) {
-
-          return;
-
-        }
-
-
-        blob.arrayBuffer()
-          .then((buffer) => {
-
-            if (
-              ws &&
-              ws.readyState === WebSocket.OPEN
-            ) {
-
-              ws.send(buffer);
-
-            }
-
-          });
-
-      },
-      'image/jpeg',
-      0.75
-    );
-
-
-    setTimeout(
-      sendLoop,
-      200
-    );
-
+    if (data.type==='detection' || data.status) { renderFrame(data); updateTelemetry(data); updateStatus(data); }
+  };
+  ws.onclose=(event)=>{
+    const unexpected = ws !== null;   // stopMonitoring() nulls ws first for intentional closes
+    sending=false; authenticatedSocket=false; if (sendTimer) clearTimeout(sendTimer); setConnectionState('offline');
+    if (!unexpected) return;
+    const why = event.code===1008 ? 'Session authorization failed. Please log in again.'
+              : event.code===1011 ? 'The server could not process video (detector error). Check the backend log.'
+              : 'Connection to the monitoring server was lost.';
+    setStatus(why, true);
+    stopMonitoring(why);               // release camera + complete the backend session
+  };
+  ws.onerror=()=>setConnectionState('offline');
+}
+function sendLoop() {
+  if (!sending || !authenticatedSocket || !ws || ws.readyState!==WebSocket.OPEN) return;
+  if (!frameBusy && hiddenVideo.readyState>=2) {
+    frameBusy=true;
+    captureCtx.drawImage(hiddenVideo,0,0,captureCanvas.width,captureCanvas.height);
+    captureCanvas.toBlob(async blob=>{
+      try { if (blob && sending && authenticatedSocket && ws?.readyState===WebSocket.OPEN && blob.size<=2*1024*1024) ws.send(await blob.arrayBuffer()); }
+      catch(err) { console.warn('Frame send failed',err); }
+      finally { frameBusy=false; }
+    },'image/jpeg',0.72);
   }
-
-
-  function renderFrame(data) {
-
-    if (!data.frame) {
-      return;
-    }
-
-
-    const img =
-      new Image();
-
-
-    img.onload = () => {
-
-      ctx.clearRect(
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-
-
-      ctx.drawImage(
-        img,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-
-    };
-
-
-    img.src =
-      'data:image/jpeg;base64,' +
-      data.frame;
-
+  sendTimer=setTimeout(sendLoop,200);
+}
+function renderFrame(data) {
+  if (!data.frame) return;
+  const img=new Image(); img.onload=()=>{ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0,canvas.width,canvas.height);}; img.src='data:image/jpeg;base64,'+data.frame;
+}
+function updateTelemetry(data) {
+  document.getElementById('faceCount').textContent=data.face_count ?? '—';
+  for (const key of ['pitch','yaw','roll']) document.getElementById(key).textContent=Number.isFinite(Number(data[key]))?Number(data[key]).toFixed(1):'—';
+}
+let violationTimeout = null;
+function updateStatus(data) {
+  let status = String(data.status || 'UNKNOWN');
+  if (data.calibrated === false && typeof data.calibration_progress === 'number') {
+    status = `CALIBRATING (${Math.round(data.calibration_progress * 100)}%)` + (data.calibration_message ? ` - ${data.calibration_message}` : '');
   }
-
-
-  function updateTelemetry(data) {
-
-    document.getElementById(
-      'faceCount'
-    ).textContent =
-      data.face_count ?? '—';
-
-
-    document.getElementById(
-      'pitch'
-    ).textContent =
-      data.pitch !== undefined
-        ? Number(data.pitch).toFixed(1)
-        : '—';
-
-
-    document.getElementById(
-      'yaw'
-    ).textContent =
-      data.yaw !== undefined
-        ? Number(data.yaw).toFixed(1)
-        : '—';
-
-
-    document.getElementById(
-      'roll'
-    ).textContent =
-      data.roll !== undefined
-        ? Number(data.roll).toFixed(1)
-        : '—';
-
+  const flagged = String(data.status||'').startsWith('FLAGGED') || (Array.isArray(data.violations) && data.violations.length > 0);
+  setStatus(status, flagged);
+  if (flagged) showViolation(status);
+}
+function showViolation(status) {
+  const panel = document.getElementById('violationPanel');
+  document.getElementById('violationText').textContent = status;
+  panel.style.display = 'block';
+  if (violationTimeout) clearTimeout(violationTimeout);
+  violationTimeout = setTimeout(() => { panel.style.display = 'none'; }, 2500);
+}
+async function stopMonitoring(reason) {
+  if (stopping) return; stopping = true;
+  sending=false; authenticatedSocket=false; if(sendTimer) clearTimeout(sendTimer);
+  if(ws) { const socket=ws; ws=null; socket.close(1000,'Student stopped monitoring'); }
+  if(mediaStream) {mediaStream.getTracks().forEach(t=>t.stop());mediaStream=null;}
+  if(sessionId) {
+    try { const r=await apiFetch(`/api/v1/sessions/${sessionId}`,{method:'DELETE'}); if(!r.ok) console.warn('Session completion failed',r.status); }
+    catch(err) { console.warn('Session completion request failed',err); }
   }
-
-
-  function updateStatus(data) {
-
-    const statusBox =
-      document.getElementById(
-        'statusBox'
-      );
-
-
-    const status =
-      data.status || 'UNKNOWN';
-
-
-    if (
-      status.startsWith('FLAGGED')
-    ) {
-
-      statusBox.textContent =
-        status;
-
-
-      statusBox.className =
-        'status-box flagged';
-
-
-      showViolation(
-        status
-      );
-
-    } else {
-
-      statusBox.textContent =
-        status;
-
-
-      statusBox.className =
-        'status-box secure';
-
-    }
-
-  }
-
-
-  function showViolation(status) {
-
-    const panel =
-      document.getElementById(
-        'violationPanel'
-      );
-
-
-    const text =
-      document.getElementById(
-        'violationText'
-      );
-
-
-    text.textContent =
-      status;
-
-
-    panel.style.display =
-      'block';
-
-
-    violationCount++;
-
-
-    setTimeout(() => {
-
-      panel.style.display =
-        'none';
-
-    }, 1500);
-
-  }
-
-
-  async function stopMonitoring() {
-
-    sending = false;
-
-
-    if (ws) {
-
-      ws.close();
-
-      ws = null;
-
-    }
-
-
-    if (mediaStream) {
-
-      mediaStream
-        .getTracks()
-        .forEach(
-          track => track.stop()
-        );
-
-      mediaStream = null;
-
-    }
-
-
-    /*
-      Mark the persistent session as completed.
-    */
-
-    if (sessionId) {
-
-      const token =
-        localStorage.getItem(
-          'token'
-        );
-
-
-      try {
-
-        const response =
-          await fetch(
-            `http://127.0.0.1:8000/api/v1/sessions/${sessionId}`,
-            {
-              method: 'DELETE',
-
-              headers: {
-                'Authorization':
-                  `Bearer ${token}`
-              }
-            }
-          );
-
-
-        if (response.ok) {
-
-          console.log(
-            'Exam session completed:',
-            sessionId
-          );
-
-        } else {
-
-          console.error(
-            'Failed to complete session:',
-            response.status
-          );
-
-        }
-
-      } catch (err) {
-
-        console.error(
-          'Error completing session:',
-          err
-        );
-
-      }
-
-    }
-
-
-    setConnectionState(
-      'offline'
-    );
-
-
-    placeholder.style.display =
-      'block';
-
-
-    canvas.style.display =
-      'none';
-
-
-    startBtn.textContent =
-      'Start monitoring';
-
-
-    startBtn.onclick =
-      startMonitoring;
-
-  }
-
-
-  startBtn.onclick =
-    startMonitoring;
-
-
-  setConnectionState(
-    'offline'
-  );
-
+  sessionId=null; setConnectionState('offline');
+  setStatus(typeof reason==='string' && reason ? reason : 'Monitoring stopped', typeof reason==='string' && !!reason);
+  placeholder.style.display='block'; canvas.style.display='none';
+  startBtn.textContent='Start monitoring'; startBtn.onclick=startMonitoring; stopping=false;
+}
+window.addEventListener('beforeunload',()=>{ sending=false; if(ws) ws.close(); if(mediaStream) mediaStream.getTracks().forEach(t=>t.stop()); });
+startBtn.onclick=startMonitoring; setConnectionState('offline');
 </script>
 
 </body>
